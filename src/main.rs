@@ -5,7 +5,8 @@ use std::{
 
 use axum::{
     Form, Router,
-    extract::State,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode, header},
     response::{Html, Redirect},
     routing::get,
 };
@@ -40,6 +41,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(home))
         .route("/setup", get(setup_form).post(create_account))
+        .route("/users/{username}", get(profile))
         .with_state(AppState {
             db: Arc::new(Mutex::new(db)),
         });
@@ -115,6 +117,23 @@ async fn create_account(State(state): State<AppState>, Form(form): Form<SetupFor
     Redirect::to("/")
 }
 
+async fn profile(
+    State(state): State<AppState>,
+    Path(username): Path<String>,
+    headers: HeaderMap,
+) -> Result<Html<String>, StatusCode> {
+    let user = load_user_by_username(&state, &username)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or(BIND);
+    let handle = format!("@{}@{}", user.username, host);
+
+    Ok(Html(layout(&profile_html(&user.username, &handle))))
+}
+
 fn load_user(state: &AppState) -> rusqlite::Result<Option<User>> {
     let db = state.db.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
 
@@ -123,6 +142,21 @@ fn load_user(state: &AppState) -> rusqlite::Result<Option<User>> {
             username: row.get(0)?,
         })
     })
+    .optional()
+}
+
+fn load_user_by_username(state: &AppState, username: &str) -> rusqlite::Result<Option<User>> {
+    let db = state.db.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
+
+    db.query_row(
+        "SELECT username FROM users WHERE username = ?1",
+        params![username],
+        |row| {
+            Ok(User {
+                username: row.get(0)?,
+            })
+        },
+    )
     .optional()
 }
 
@@ -146,6 +180,19 @@ fn setup_form_html() -> String {
     </form>
     "#
     .to_string()
+}
+
+fn profile_html(name: &str, handle: &str) -> String {
+    format!(
+        r#"
+        <hgroup>
+            <h1>{}</h1>
+            <p style="user-select: all;">{}</p>
+        </hgroup>
+        "#,
+        escape(name),
+        escape(handle)
+    )
 }
 
 fn layout(body: &str) -> String {
