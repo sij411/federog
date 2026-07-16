@@ -1,0 +1,27 @@
+[package]
+name = "federog"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+
+[dependencies]
+axum = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+feder-core = { path = "../feder/crates/feder-core" }
+feder-runtime-server = { path = "../feder/crates/feder-runtime-server" }
+feder-vocab = { path = "../feder/crates/feder-vocab" }
+html-escape = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+all = "deny"
