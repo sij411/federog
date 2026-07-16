@@ -1,0 +1,21 @@
+[tools.rust]
+version = "1.95.0"
+profile = "default"
+components = "rust-analyzer,rustfmt,clippy"
+
+[tasks.check]
+description = "Run type check, lint, formatting check, and tests"
+run = [
+  "cargo check",
+  "cargo clippy",
+  "cargo fmt --check",
+  "cargo test",
+]
+
+[tasks.fmt]
+description = "Format Rust code"
+run = "cargo fmt"
+
+[tasks.test]
+description = "Run the Rust tests"
+run = "cargo test"
