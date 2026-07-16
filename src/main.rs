@@ -1,387 +1,179 @@
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
+
 use axum::{
     Form, Router,
     extract::State,
-    http::{StatusCode, header},
-    response::{Html, IntoResponse, Redirect, Response},
-    routing::{get, post},
+    response::{Html, Redirect},
+    routing::get,
 };
-use chrono::{SecondsFormat, Utc};
-use feder_runtime_server::{
-    AppState, Error, InboxAuthPolicy, RuntimeConfig, StorageConfig,
-    actor::actor,
-    inbox::inbox,
-    storage::RuntimeStore,
-    webfinger::webfinger,
-};
-use feder_vocab::{Iri, Reference};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
-use std::sync::{Arc, Mutex};
 
-const USERNAME: &str = "alice";
-const BIND: &str = "127.0.0.1:3000";
-const BASE_URL: &str = "http://127.0.0.1:3000";
+const BIND: &str = "0.0.0.0:3000";
+const DB_PATH: &str = "microblog.sqlite3";
 
 #[derive(Clone)]
-struct FederogState {
-    runtime: AppState,
-    posts: Arc<Mutex<Vec<LocalPost>>>,
+struct AppState {
+    db: Arc<Mutex<Connection>>,
 }
 
-#[derive(Clone)]
-struct LocalPost {
-    note: feder_vocab::Note,
-    activity: feder_vocab::Create<feder_vocab::Note>,
+#[derive(Clone, Debug)]
+struct User {
+    username: String,
 }
 
 #[derive(Deserialize)]
-struct PostForm {
-    content: String,
-}
-
-fn runtime_config() -> RuntimeConfig {
-    RuntimeConfig {
-        bind: BIND.parse().expect("valid bind address"),
-        actor_id: iri(&format!("{BASE_URL}/users/{USERNAME}")),
-        inbox: iri(&format!("{BASE_URL}/users/{USERNAME}/inbox")),
-        outbox: iri(&format!("{BASE_URL}/users/{USERNAME}/outbox")),
-        username: USERNAME.to_string(),
-        handle_host: BIND.to_string(),
-        inbox_auth_policy: InboxAuthPolicy::AllowUnsignedInsecureDev,
-        storage: StorageConfig::InMemory,
-    }
+struct SetupForm {
+    username: String,
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Error> {
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let config = runtime_config();
-    let bind = config.bind;
-    let actor_id = config.actor_id.clone();
-    let state = FederogState {
-        runtime: AppState::from_config(config)?,
-        posts: Arc::new(Mutex::new(Vec::new())),
-    };
-    let app = build_router(state);
+    let db = open_db(DB_PATH)?;
+    let app = Router::new()
+        .route("/", get(home))
+        .route("/setup", get(setup_form).post(create_account))
+        .with_state(AppState {
+            db: Arc::new(Mutex::new(db)),
+        });
 
-    tracing::info!(bind = %bind, actor = %actor_id, "starting federog");
+    let bind: SocketAddr = BIND.parse()?;
+    tracing::info!(bind = %bind, "starting federog");
 
-    let listener = tokio::net::TcpListener::bind(bind)
-        .await
-        .map_err(Error::Bind)?;
-    axum::serve(listener, app).await.map_err(Error::Serve)?;
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    axum::serve(listener, app).await?;
 
     Ok(())
 }
 
-fn build_router(state: FederogState) -> Router {
-    Router::new()
-        .route("/", get(home).post(create_post))
-        .route("/healthz", get(healthz))
-        .route("/.well-known/webfinger", get(runtime_webfinger))
-        .route("/users/{username}", get(runtime_actor))
-        .route("/users/{username}/inbox", post(runtime_inbox))
-        .route("/users/{username}/followers", get(followers))
-        .route("/users/{username}/outbox", get(outbox))
-        .with_state(state)
+fn open_db(path: &str) -> rusqlite::Result<Connection> {
+    let db = Connection::open(path)?;
+    db.pragma_update(None, "journal_mode", "WAL")?;
+    db.pragma_update(None, "foreign_keys", "ON")?;
+    db.execute_batch(include_str!("schema.sql"))?;
+    Ok(db)
 }
 
-async fn healthz() -> StatusCode {
-    StatusCode::NO_CONTENT
+async fn home(State(state): State<AppState>) -> Result<Html<String>, Redirect> {
+    let Some(user) = load_user(&state).map_err(|_| Redirect::to("/setup"))? else {
+        return Err(Redirect::to("/setup"));
+    };
+
+    Ok(Html(layout(&format!(
+        r#"
+        <h1>Microblog</h1>
+        <p>Account <strong>{}</strong> is set up.</p>
+        "#,
+        escape(&user.username)
+    ))))
 }
 
-async fn home(State(state): State<FederogState>) -> Result<Html<String>, StatusCode> {
-    let posts = state
-        .posts
-        .lock()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let post_items = posts
-        .iter()
-        .rev()
-        .map(|post| {
-            format!(
-                r#"<article class="post"><p>{}</p><small>{}</small></article>"#,
-                escape(post.note.content.as_deref().unwrap_or("")),
-                escape(post.note.published.as_deref().unwrap_or(""))
-            )
-        })
-        .collect::<Vec<_>>();
-
-    Ok(Html(page(
-        "Federog",
-        &format!(
-            r#"
-            <section class="composer">
-                <h1>{}</h1>
-                <p class="handle">@{}@{}</p>
-                <form method="post" action="/">
-                    <textarea name="content" rows="5" maxlength="500" required></textarea>
-                    <button type="submit">Post</button>
-                </form>
-            </section>
-            <section>
-                <h2>Posts</h2>
-                {}
-            </section>
-            "#,
-            escape(&state.runtime.username),
-            escape(&state.runtime.username),
-            escape(&state.runtime.handle_host),
-            if post_items.is_empty() {
-                r#"<p class="empty">No posts yet.</p>"#.to_string()
-            } else {
-                post_items.join("\n")
-            }
-        ),
-    )))
-}
-
-async fn create_post(
-    State(state): State<FederogState>,
-    Form(form): Form<PostForm>,
-) -> Result<Redirect, StatusCode> {
-    let content = form.content.trim();
-    if content.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+async fn setup_form(State(state): State<AppState>) -> Result<Html<String>, Redirect> {
+    if load_user(&state)
+        .map_err(|_| Redirect::to("/setup"))?
+        .is_some()
+    {
+        return Err(Redirect::to("/"));
     }
 
-    let now = Utc::now();
-    let slug = now.timestamp_millis();
-    let note_id = iri(&format!("{BASE_URL}/users/{USERNAME}/posts/{slug}"));
-    let create_id = iri(&format!("{BASE_URL}/users/{USERNAME}/activities/create/{slug}"));
-
-    let mut note = feder_vocab::Note::new(note_id);
-    note.attributed_to = Some(Reference::id(state.runtime.local_actor.id.clone()));
-    note.content = Some(content.to_string());
-    note.published = Some(now.to_rfc3339_opts(SecondsFormat::Secs, true));
-    let activity = feder_vocab::Create::new(
-        create_id,
-        Reference::id(state.runtime.local_actor.id.clone()),
-        Reference::object(note.clone()),
-    );
-
-    let decision = feder_core::Decision {
-        state_changes: vec![
-            feder_core::StateChange::StoreObject {
-                object: feder_core::Object::Note(note.clone()),
-            },
-            feder_core::StateChange::StoreActivity {
-                activity: feder_core::Activity::CreateNote(activity.clone()),
-            },
-        ],
-        effects: Vec::new(),
-    };
-    state
-        .runtime
-        .store
-        .lock()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .apply_decision(&decision)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    state
-        .posts
-        .lock()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .push(LocalPost { note, activity });
-
-    Ok(Redirect::to("/"))
+    Ok(Html(layout(&setup_form_html())))
 }
 
-async fn followers(State(state): State<FederogState>) -> Result<Html<String>, StatusCode> {
-    let followers = state
-        .runtime
-        .store
-        .lock()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .list_followers(&state.runtime.local_actor.id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+async fn create_account(State(state): State<AppState>, Form(form): Form<SetupForm>) -> Redirect {
+    let Ok(existing_user) = load_user(&state) else {
+        return Redirect::to("/setup");
+    };
+    if existing_user.is_some() {
+        return Redirect::to("/");
+    }
 
-    let body = if followers.is_empty() {
-        r#"<p class="empty">No followers yet.</p>"#.to_string()
-    } else {
-        format!(
-            "<ul>{}</ul>",
-            followers
-                .iter()
-                .map(|follower| format!("<li>{}</li>", escape(follower.follower.as_str())))
-                .collect::<Vec<_>>()
-                .join("\n")
+    let username = form.username.trim();
+    if !is_valid_username(username) {
+        return Redirect::to("/setup");
+    }
+
+    let Ok(db) = state.db.lock() else {
+        return Redirect::to("/setup");
+    };
+    if db
+        .execute(
+            "INSERT INTO users (id, username) VALUES (1, ?1)",
+            params![username],
         )
-    };
+        .is_err()
+    {
+        return Redirect::to("/setup");
+    }
 
-    Ok(Html(page("Followers", &body)))
+    Redirect::to("/")
 }
 
-async fn outbox(State(state): State<FederogState>) -> Result<Response, StatusCode> {
-    let posts = state
-        .posts
-        .lock()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let activities = posts
-        .iter()
-        .rev()
-        .map(|post| serde_json::to_value(&post.activity))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+fn load_user(state: &AppState) -> rusqlite::Result<Option<User>> {
+    let db = state.db.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
 
-    Ok((
-        [(header::CONTENT_TYPE, "application/activity+json")],
-        serde_json::json!({
-            "@context": "https://www.w3.org/ns/activitystreams",
-            "type": "OrderedCollection",
-            "id": state.runtime.local_actor.outbox,
-            "totalItems": activities.len(),
-            "orderedItems": activities,
+    db.query_row("SELECT username FROM users LIMIT 1", [], |row| {
+        Ok(User {
+            username: row.get(0)?,
         })
-        .to_string(),
-    )
-        .into_response())
+    })
+    .optional()
 }
 
-async fn runtime_webfinger(
-    State(state): State<FederogState>,
-    query: axum::extract::Query<feder_runtime_server::webfinger::WebFingerQuery>,
-) -> Result<Response, StatusCode> {
-    webfinger(State(state.runtime), query).await
+fn setup_form_html() -> String {
+    r#"
+    <h1>Set up your microblog</h1>
+    <form method="post" action="/setup">
+        <fieldset>
+            <label>
+                Username
+                <input
+                    type="text"
+                    name="username"
+                    required
+                    maxlength="50"
+                    pattern="^[a-z0-9_-]+$"
+                />
+            </label>
+        </fieldset>
+        <input type="submit" value="Setup" />
+    </form>
+    "#
+    .to_string()
 }
 
-async fn runtime_actor(
-    State(state): State<FederogState>,
-    path: axum::extract::Path<String>,
-) -> Result<Response, StatusCode> {
-    actor(State(state.runtime), path).await
-}
-
-async fn runtime_inbox(
-    State(state): State<FederogState>,
-    path: axum::extract::Path<String>,
-    headers: axum::http::HeaderMap,
-    method: axum::http::Method,
-    uri: axum::http::Uri,
-    body: axum::body::Bytes,
-) -> Result<Response, StatusCode> {
-    inbox(State(state.runtime), path, headers, method, uri, body).await
-}
-
-fn page(title: &str, body: &str) -> String {
+fn layout(body: &str) -> String {
     format!(
         r#"<!doctype html>
 <html lang="en">
 <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{}</title>
-    <style>
-        body {{ margin: 0; font: 16px/1.5 system-ui, sans-serif; background: #f7f7f4; color: #202124; }}
-        main {{ width: min(760px, calc(100vw - 32px)); margin: 40px auto; }}
-        nav {{ display: flex; gap: 16px; margin-bottom: 24px; }}
-        a {{ color: #315f72; }}
-        h1, h2 {{ line-height: 1.1; }}
-        textarea {{ box-sizing: border-box; width: 100%; resize: vertical; padding: 12px; border: 1px solid #b9b9b2; border-radius: 6px; font: inherit; background: #fff; }}
-        button {{ margin-top: 10px; padding: 8px 14px; border: 1px solid #214657; border-radius: 6px; background: #315f72; color: white; font: inherit; cursor: pointer; }}
-        .handle, .empty, small {{ color: #666861; }}
-        .composer, .post {{ border-bottom: 1px solid #d9d9d2; padding-bottom: 24px; margin-bottom: 24px; }}
-        .post p {{ white-space: pre-wrap; }}
-    </style>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Microblog</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css" />
 </head>
 <body>
-    <main>
-        <nav><a href="/">Home</a><a href="/users/alice">Actor</a><a href="/users/alice/followers">Followers</a><a href="/users/alice/outbox">Outbox</a></nav>
-        {}
-    </main>
+    <main class="container">{body}</main>
 </body>
-</html>"#,
-        escape(title),
-        body
+</html>"#
     )
 }
 
-fn iri(value: &str) -> Iri {
-    value.parse().expect("valid IRI")
+fn is_valid_username(username: &str) -> bool {
+    !username.is_empty()
+        && username.len() <= 50
+        && username.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
+        })
 }
 
 fn escape(value: &str) -> String {
     html_escape::encode_text(value).to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use axum::{
-        body::{Body, to_bytes},
-        http::{Request, StatusCode, header},
-    };
-    use tower::ServiceExt;
-
-    use super::*;
-
-    fn test_state() -> FederogState {
-        FederogState {
-            runtime: AppState::from_config(runtime_config()).expect("build app state"),
-            posts: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    #[tokio::test]
-    async fn actor_route_uses_runtime_state() {
-        let app = build_router(test_state());
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/users/alice")
-                    .body(Body::empty())
-                    .expect("valid request"),
-            )
-            .await
-            .expect("response");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get(header::CONTENT_TYPE).unwrap(),
-            "application/activity+json"
-        );
-    }
-
-    #[tokio::test]
-    async fn post_is_added_to_home_and_outbox() {
-        let app = build_router(test_state());
-
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/")
-                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .body(Body::from("content=hello%20feder"))
-                    .expect("valid request"),
-            )
-            .await
-            .expect("response");
-
-        assert_eq!(response.status(), StatusCode::SEE_OTHER);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/users/alice/outbox")
-                    .body(Body::empty())
-                    .expect("valid request"),
-            )
-            .await
-            .expect("response");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), 4096)
-            .await
-            .expect("read body");
-        let json: serde_json::Value = serde_json::from_slice(&body).expect("json outbox");
-
-        assert_eq!(json["type"], "OrderedCollection");
-        assert_eq!(json["totalItems"], 1);
-        assert_eq!(json["orderedItems"][0]["type"], "Create");
-        assert_eq!(json["orderedItems"][0]["object"]["content"], "hello feder");
-    }
 }
