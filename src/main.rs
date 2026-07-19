@@ -6,13 +6,17 @@ use std::{
 
 use axum::{
     Form, Router,
-    extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    body::Bytes,
+    extract::{DefaultBodyLimit, Path, Query, State},
+    http::{HeaderMap, Method, StatusCode, Uri, header},
     response::{Html, IntoResponse, Redirect, Response},
-    routing::get,
+    routing::{get, post},
 };
+use feder_core::{FederConfig, FederCore};
 use feder_runtime_server::{
     AppState as FederState, InboxAuthPolicy, OutboundAddressPolicy, RuntimeConfig, StorageConfig,
+    inbox::inbox as feder_inbox,
+    send::ActivitySender,
     webfinger::{WebFingerQuery, webfinger as feder_webfinger},
 };
 use feder_vocab::{Actor, Endpoints, Iri, Reference};
@@ -58,7 +62,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(home))
         .route("/setup", get(setup_form).post(create_account))
         .route("/.well-known/webfinger", get(webfinger))
+        .route("/inbox", post(shared_inbox))
         .route("/users/{username}", get(profile))
+        .route("/users/{username}/inbox", post(personal_inbox))
+        .layer(DefaultBodyLimit::max(1_048_576))
         .with_state(AppState {
             db: Arc::new(Mutex::new(db)),
             feder: Arc::new(RwLock::new(feder)),
@@ -218,18 +225,54 @@ async fn webfinger(
     let account = load_account(&state)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
-    let mut feder = state
-        .feder
-        .read()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .clone()
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    feder.handle_host = request_host(&headers).to_string();
-    feder.local_actor = actor_for_request(&feder.local_actor, &account, &headers)
+    let feder = feder_for_request(&state, &account, &headers)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     feder_webfinger(State(feder), query).await
+}
+
+async fn personal_inbox(
+    State(state): State<AppState>,
+    Path(username): Path<String>,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
+    body: Bytes,
+) -> Result<Response, StatusCode> {
+    let account = load_account_by_username(&state, &username)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    handle_inbox(state, account, headers, method, uri, body).await
+}
+
+async fn shared_inbox(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
+    body: Bytes,
+) -> Result<Response, StatusCode> {
+    let account = load_account(&state)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    handle_inbox(state, account, headers, method, uri, body).await
+}
+
+async fn handle_inbox(
+    state: AppState,
+    account: Account,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
+    body: Bytes,
+) -> Result<Response, StatusCode> {
+    let feder = feder_for_request(&state, &account, &headers)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let username = account.username;
+
+    feder_inbox(State(feder), Path(username), headers, method, uri, body).await
 }
 
 fn load_account(state: &AppState) -> rusqlite::Result<Option<Account>> {
@@ -344,8 +387,8 @@ fn build_feder_state(account: &Account) -> anyhow::Result<FederState> {
             .and_then(|handle| handle.split_once('@'))
             .map(|(_, host)| host.to_string())
             .ok_or_else(|| anyhow::anyhow!("invalid actor handle: {}", account.handle))?,
-        inbox_auth_policy: InboxAuthPolicy::AllowUnsignedInsecureDev,
-        outbound_address_policy: OutboundAddressPolicy::AllowPrivateAddress,
+        inbox_auth_policy: InboxAuthPolicy::RequireSigned,
+        outbound_address_policy: OutboundAddressPolicy::PublicOnly,
         storage: StorageConfig::Sqlite {
             path: PathBuf::from(DB_PATH),
         },
@@ -374,19 +417,50 @@ fn actor_json(
     account: &Account,
     headers: &HeaderMap,
 ) -> anyhow::Result<serde_json::Value> {
-    let feder = state
-        .feder
-        .read()
-        .map_err(|_| anyhow::anyhow!("Feder state lock poisoned"))?;
-    let feder = feder
-        .as_ref()
-        .filter(|feder| feder.username == account.username)
-        .ok_or_else(|| anyhow::anyhow!("Feder state is not initialized"))?;
-    let local_actor = actor_for_request(&feder.local_actor, account, headers)?;
-    let mut actor = serde_json::to_value(&local_actor)?;
-    actor["url"] = serde_json::Value::String(local_actor.id.to_string());
+    let feder = feder_for_request(state, account, headers)?;
+    let mut actor = serde_json::to_value(&feder.local_actor)?;
+    actor["url"] = serde_json::Value::String(feder.local_actor.id.to_string());
 
     Ok(actor)
+}
+
+fn feder_for_request(
+    state: &AppState,
+    account: &Account,
+    headers: &HeaderMap,
+) -> anyhow::Result<FederState> {
+    let mut feder = state
+        .feder
+        .read()
+        .map_err(|_| anyhow::anyhow!("Feder state lock poisoned"))?
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Feder state is not initialized"))?;
+    let actor = actor_for_request(&feder.local_actor, account, headers)?;
+    let actor_changed = actor.id != feder.local_actor.id;
+
+    feder.handle_host = request_host(headers).to_string();
+    if actor_changed {
+        let key_id = match actor.public_key.as_ref() {
+            Some(Reference::Id(key_id)) => key_id.to_string(),
+            Some(Reference::Object(key)) => key.id.to_string(),
+            None => return Err(anyhow::anyhow!("local actor has no public key")),
+        };
+        feder.core = Arc::new(Mutex::new(FederCore::new(FederConfig::new(actor.clone()))));
+        feder.activity_sender = ActivitySender::new(
+            feder.actor_key_pair.clone(),
+            key_id,
+            OutboundAddressPolicy::PublicOnly,
+        )?;
+        feder.local_actor = actor;
+
+        let mut current_feder = state
+            .feder
+            .write()
+            .map_err(|_| anyhow::anyhow!("Feder state lock poisoned"))?;
+        *current_feder = Some(feder.clone());
+    }
+
+    Ok(feder)
 }
 
 fn actor_for_request(
