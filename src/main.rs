@@ -6,15 +6,16 @@ use std::{
 
 use axum::{
     Form, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
 };
 use feder_runtime_server::{
     AppState as FederState, InboxAuthPolicy, OutboundAddressPolicy, RuntimeConfig, StorageConfig,
+    webfinger::{WebFingerQuery, webfinger as feder_webfinger},
 };
-use feder_vocab::{Endpoints, Iri};
+use feder_vocab::{Actor, Endpoints, Iri, Reference};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 
@@ -35,7 +36,6 @@ struct Account {
     handle: String,
     inbox_url: String,
     shared_inbox_url: Option<String>,
-    url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -57,6 +57,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(home))
         .route("/setup", get(setup_form).post(create_account))
+        .route("/.well-known/webfinger", get(webfinger))
         .route("/users/{username}", get(profile))
         .with_state(AppState {
             db: Arc::new(Mutex::new(db)),
@@ -171,7 +172,6 @@ async fn create_account(
         handle,
         inbox_url,
         shared_inbox_url: Some(shared_inbox_url),
-        url: Some(actor_uri),
     };
     let Ok(feder) = build_feder_state(&account) else {
         return Redirect::to("/");
@@ -194,7 +194,8 @@ async fn profile(
         .ok_or(StatusCode::NOT_FOUND)?;
 
     if wants_activity_json(&headers) {
-        let actor = actor_json(&state, &account).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let actor = actor_json(&state, &account, &headers)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         return Ok((
             [(header::CONTENT_TYPE, "application/activity+json")],
             actor.to_string(),
@@ -204,9 +205,31 @@ async fn profile(
 
     Ok(Html(layout(&profile_html(
         &display_name(&account),
-        &account.handle,
+        &format!("@{}@{}", account.username, request_host(&headers)),
     )))
     .into_response())
+}
+
+async fn webfinger(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    query: Query<WebFingerQuery>,
+) -> Result<Response, StatusCode> {
+    let account = load_account(&state)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let mut feder = state
+        .feder
+        .read()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .clone()
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    feder.handle_host = request_host(&headers).to_string();
+    feder.local_actor = actor_for_request(&feder.local_actor, &account, &headers)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    feder_webfinger(State(feder), query).await
 }
 
 fn load_account(state: &AppState) -> rusqlite::Result<Option<Account>> {
@@ -224,8 +247,7 @@ fn load_account_from_db(db: &Connection) -> rusqlite::Result<Option<Account>> {
           actors.uri,
           actors.handle,
           actors.inbox_url,
-          actors.shared_inbox_url,
-          actors.url
+          actors.shared_inbox_url
         FROM users
         JOIN actors ON users.id = actors.user_id
         LIMIT 1
@@ -247,8 +269,7 @@ fn load_account_by_username(state: &AppState, username: &str) -> rusqlite::Resul
           actors.uri,
           actors.handle,
           actors.inbox_url,
-          actors.shared_inbox_url,
-          actors.url
+          actors.shared_inbox_url
         FROM users
         JOIN actors ON users.id = actors.user_id
         WHERE users.username = ?1
@@ -267,7 +288,6 @@ fn account_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
         handle: row.get(3)?,
         inbox_url: row.get(4)?,
         shared_inbox_url: row.get(5)?,
-        url: row.get(6)?,
     })
 }
 
@@ -349,7 +369,11 @@ fn parse_iri(value: &str) -> anyhow::Result<Iri> {
         .map_err(|error| anyhow::anyhow!("invalid IRI {value}: {error}"))
 }
 
-fn actor_json(state: &AppState, account: &Account) -> anyhow::Result<serde_json::Value> {
+fn actor_json(
+    state: &AppState,
+    account: &Account,
+    headers: &HeaderMap,
+) -> anyhow::Result<serde_json::Value> {
     let feder = state
         .feder
         .read()
@@ -358,9 +382,37 @@ fn actor_json(state: &AppState, account: &Account) -> anyhow::Result<serde_json:
         .as_ref()
         .filter(|feder| feder.username == account.username)
         .ok_or_else(|| anyhow::anyhow!("Feder state is not initialized"))?;
-    let mut actor = serde_json::to_value(&feder.local_actor)?;
-    actor["url"] =
-        serde_json::Value::String(account.url.clone().unwrap_or_else(|| account.uri.clone()));
+    let local_actor = actor_for_request(&feder.local_actor, account, headers)?;
+    let mut actor = serde_json::to_value(&local_actor)?;
+    actor["url"] = serde_json::Value::String(local_actor.id.to_string());
+
+    Ok(actor)
+}
+
+fn actor_for_request(
+    actor: &Actor,
+    account: &Account,
+    headers: &HeaderMap,
+) -> anyhow::Result<Actor> {
+    let mut actor = actor.clone();
+    let actor_uri = format!("{}/users/{}", request_origin(headers), account.username);
+    actor.id = parse_iri(&actor_uri)?;
+    actor.inbox = parse_iri(&format!("{actor_uri}/inbox"))?;
+    actor.outbox = parse_iri(&format!("{actor_uri}/outbox"))?;
+    actor.endpoints = Some(Endpoints {
+        shared_inbox: Some(parse_iri(&format!("{}/inbox", request_origin(headers)))?),
+    });
+
+    match actor.public_key.as_mut() {
+        Some(Reference::Id(key_id)) => {
+            *key_id = parse_iri(&format!("{actor_uri}#main-key"))?;
+        }
+        Some(Reference::Object(key)) => {
+            key.id = parse_iri(&format!("{actor_uri}#main-key"))?;
+            key.owner = actor.id.clone();
+        }
+        None => {}
+    }
 
     Ok(actor)
 }
@@ -376,13 +428,24 @@ fn wants_activity_json(headers: &HeaderMap) -> bool {
 
 fn request_host(headers: &HeaderMap) -> &str {
     headers
-        .get(header::HOST)
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(header::HOST))
         .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .unwrap_or(BIND)
 }
 
 fn request_origin(headers: &HeaderMap) -> String {
-    format!("http://{}", request_host(headers))
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| *value == "http" || *value == "https")
+        .unwrap_or("http");
+    format!("{scheme}://{}", request_host(headers))
 }
 
 fn display_name(account: &Account) -> String {
