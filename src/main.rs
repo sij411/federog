@@ -50,9 +50,9 @@ struct SetupForm {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    let log_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(log_filter).init();
 
     let db = open_db(DB_PATH)?;
     let feder = load_account_from_db(&db)?
@@ -271,8 +271,49 @@ async fn handle_inbox(
     let feder = feder_for_request(&state, &account, &headers)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let username = account.username;
+    let activity = serde_json::from_slice::<serde_json::Value>(&body).ok();
+    let activity_type = activity
+        .as_ref()
+        .and_then(|value| value.get("type"))
+        .and_then(serde_json::Value::as_str);
+    let activity_id = activity
+        .as_ref()
+        .and_then(|value| value.get("id"))
+        .and_then(serde_json::Value::as_str);
+    let actor_id = activity
+        .as_ref()
+        .and_then(|value| value.get("actor"))
+        .and_then(reference_id);
+    let object_id = activity
+        .as_ref()
+        .and_then(|value| value.get("object"))
+        .and_then(reference_id);
 
-    feder_inbox(State(feder), Path(username), headers, method, uri, body).await
+    tracing::info!(
+        method = %method,
+        uri = %uri,
+        activity_type,
+        activity_id,
+        actor_id,
+        object_id,
+        local_actor_id = %feder.local_actor.id,
+        has_signature = headers.contains_key("signature"),
+        "received inbox request"
+    );
+
+    let result = feder_inbox(State(feder), Path(username), headers, method, uri, body).await;
+    match &result {
+        Ok(response) => tracing::info!(status = %response.status(), "handled inbox request"),
+        Err(status) => tracing::warn!(status = %status, "rejected inbox request"),
+    }
+
+    result
+}
+
+fn reference_id(value: &serde_json::Value) -> Option<&str> {
+    value
+        .as_str()
+        .or_else(|| value.get("id").and_then(serde_json::Value::as_str))
 }
 
 fn load_account(state: &AppState) -> rusqlite::Result<Option<Account>> {
