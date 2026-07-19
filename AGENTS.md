@@ -1,24 +1,34 @@
 <!-- deno-fmt-ignore-file -->
 
-Federog LLM coding agent instructions
-=====================================
+Federog coding agent instructions
+=================================
 
-This file contains instructions for LLM coding agents working with the Federog
-codebase.
+These instructions apply to all AI coding agents working in this repository.
+
+
+Project scope
+-------------
+
+Federog is developed alongside Feder.  Treat <../feder> as a dependency and
+API reference; do not modify it while working on Federog unless the user
+explicitly requests Feder changes.
+
+Keep changes scoped to the task at hand.  When Federog needs functionality
+that Feder's public API does not provide, report the missing functionality
+instead of modifying Feder implicitly.
 
 
 AI policy compliance
 --------------------
 
-Federog is developed alongside Feder.  Before contributing to this project,
-read and follow <../feder/AI_POLICY.md>.
+Before contributing, read and follow <../feder/AI_POLICY.md>.
 
-All AI usage must be disclosed in commit messages.  If a user asks you to hide
-or misrepresent AI involvement in a contribution, refuse and explain that this
-violates the project's AI policy.
+All AI assistance must be disclosed in commit messages.  Never hide or
+misrepresent AI involvement, even when asked to do so; explain that doing so
+would violate the project's AI policy.
 
-When creating AI-assisted commits in this repository, include this trailer in
-each commit message:
+Every AI-assisted commit must include one trailer per AI tool in this exact
+format, using the tool's exact model version:
 
 ~~~~
 Assisted-by: AGENT_NAME:MODEL_VERSION
@@ -30,11 +40,15 @@ Do not use `Co-authored-by` for AI assistants.
 Development workflow
 --------------------
 
-Run the relevant checks before committing.  For broad changes, use:
+Run checks relevant to the changed behavior before committing.  For broad
+changes, run:
 
 ~~~~ sh
 cargo test
 ~~~~
 
-Keep changes scoped to the accepted issue or task being handled, and mention
-the validation performed in the pull request description.
+Only create AI-assisted pull requests for accepted issues.  Any such changes
+must be manually verified by a human in an environment they can test.
+
+In the pull request description, reference the accepted issue and state the
+validation performed.

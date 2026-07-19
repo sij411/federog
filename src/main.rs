@@ -1,6 +1,7 @@
 use std::{
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    path::PathBuf,
+    sync::{Arc, Mutex, RwLock},
 };
 
 use axum::{
@@ -10,6 +11,10 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
 };
+use feder_runtime_server::{
+    AppState as FederState, InboxAuthPolicy, OutboundAddressPolicy, RuntimeConfig, StorageConfig,
+};
+use feder_vocab::{Endpoints, Iri};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 
@@ -19,6 +24,7 @@ const DB_PATH: &str = "microblog.sqlite3";
 #[derive(Clone)]
 struct AppState {
     db: Arc<Mutex<Connection>>,
+    feder: Arc<RwLock<Option<FederState>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -45,12 +51,16 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let db = open_db(DB_PATH)?;
+    let feder = load_account_from_db(&db)?
+        .map(|account| build_feder_state(&account))
+        .transpose()?;
     let app = Router::new()
         .route("/", get(home))
         .route("/setup", get(setup_form).post(create_account))
         .route("/users/{username}", get(profile))
         .with_state(AppState {
             db: Arc::new(Mutex::new(db)),
+            feder: Arc::new(RwLock::new(feder)),
         });
 
     let bind: SocketAddr = BIND.parse()?;
@@ -123,34 +133,53 @@ async fn create_account(
     let inbox_url = format!("{actor_uri}/inbox");
     let shared_inbox_url = format!("{origin}/inbox");
 
-    let Ok(mut db) = state.db.lock() else {
-        return Redirect::to("/setup");
-    };
-    let result = db.transaction().and_then(|tx| {
-        tx.execute(
-            "INSERT OR REPLACE INTO users (id, username) VALUES (1, ?1)",
-            params![username],
-        )?;
-        tx.execute(
-            r#"
-            INSERT OR REPLACE INTO actors
-              (user_id, uri, handle, name, inbox_url, shared_inbox_url, url)
-            VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
-            "#,
-            params![
-                actor_uri,
-                handle,
-                name,
-                inbox_url,
-                shared_inbox_url,
-                actor_uri
-            ],
-        )?;
-        tx.commit()
-    });
+    let result = state
+        .db
+        .lock()
+        .map_or(Err(rusqlite::Error::InvalidQuery), |mut db| {
+            db.transaction().and_then(|tx| {
+                tx.execute(
+                    "INSERT OR REPLACE INTO users (id, username) VALUES (1, ?1)",
+                    params![username],
+                )?;
+                tx.execute(
+                    r#"
+                INSERT OR REPLACE INTO actors
+                  (user_id, uri, handle, name, inbox_url, shared_inbox_url, url)
+                VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+                    params![
+                        actor_uri,
+                        handle,
+                        name,
+                        inbox_url,
+                        shared_inbox_url,
+                        actor_uri
+                    ],
+                )?;
+                tx.commit()
+            })
+        });
     if result.is_err() {
         return Redirect::to("/setup");
     }
+
+    let account = Account {
+        username: username.to_string(),
+        name: Some(name.to_string()),
+        uri: actor_uri.clone(),
+        handle,
+        inbox_url,
+        shared_inbox_url: Some(shared_inbox_url),
+        url: Some(actor_uri),
+    };
+    let Ok(feder) = build_feder_state(&account) else {
+        return Redirect::to("/");
+    };
+    let Ok(mut current_feder) = state.feder.write() else {
+        return Redirect::to("/");
+    };
+    *current_feder = Some(feder);
 
     Redirect::to("/")
 }
@@ -165,9 +194,10 @@ async fn profile(
         .ok_or(StatusCode::NOT_FOUND)?;
 
     if wants_activity_json(&headers) {
+        let actor = actor_json(&state, &account).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         return Ok((
             [(header::CONTENT_TYPE, "application/activity+json")],
-            actor_json(&account).to_string(),
+            actor.to_string(),
         )
             .into_response());
     }
@@ -182,6 +212,10 @@ async fn profile(
 fn load_account(state: &AppState) -> rusqlite::Result<Option<Account>> {
     let db = state.db.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
 
+    load_account_from_db(&db)
+}
+
+fn load_account_from_db(db: &Connection) -> rusqlite::Result<Option<Account>> {
     db.query_row(
         r#"
         SELECT
@@ -276,19 +310,59 @@ fn profile_html(name: &str, handle: &str) -> String {
     )
 }
 
-fn actor_json(account: &Account) -> serde_json::Value {
-    serde_json::json!({
-        "@context": "https://www.w3.org/ns/activitystreams",
-        "type": "Person",
-        "id": account.uri,
-        "preferredUsername": account.username,
-        "name": display_name(account),
-        "inbox": account.inbox_url,
-        "endpoints": {
-            "sharedInbox": account.shared_inbox_url,
+fn build_feder_state(account: &Account) -> anyhow::Result<FederState> {
+    let outbox = format!("{}/outbox", account.uri);
+    let mut feder = FederState::from_config(RuntimeConfig {
+        bind: BIND.parse()?,
+        actor_id: parse_iri(&account.uri)?,
+        inbox: parse_iri(&account.inbox_url)?,
+        outbox: parse_iri(&outbox)?,
+        username: account.username.clone(),
+        handle_host: account
+            .handle
+            .strip_prefix('@')
+            .and_then(|handle| handle.split_once('@'))
+            .map(|(_, host)| host.to_string())
+            .ok_or_else(|| anyhow::anyhow!("invalid actor handle: {}", account.handle))?,
+        inbox_auth_policy: InboxAuthPolicy::AllowUnsignedInsecureDev,
+        outbound_address_policy: OutboundAddressPolicy::AllowPrivateAddress,
+        storage: StorageConfig::Sqlite {
+            path: PathBuf::from(DB_PATH),
         },
-        "url": account.url.as_deref().unwrap_or(&account.uri),
-    })
+    })?;
+    feder.local_actor.name = Some(display_name(account));
+    feder.local_actor.endpoints = account
+        .shared_inbox_url
+        .as_deref()
+        .map(parse_iri)
+        .transpose()?
+        .map(|shared_inbox| Endpoints {
+            shared_inbox: Some(shared_inbox),
+        });
+
+    Ok(feder)
+}
+
+fn parse_iri(value: &str) -> anyhow::Result<Iri> {
+    value
+        .parse()
+        .map_err(|error| anyhow::anyhow!("invalid IRI {value}: {error}"))
+}
+
+fn actor_json(state: &AppState, account: &Account) -> anyhow::Result<serde_json::Value> {
+    let feder = state
+        .feder
+        .read()
+        .map_err(|_| anyhow::anyhow!("Feder state lock poisoned"))?;
+    let feder = feder
+        .as_ref()
+        .filter(|feder| feder.username == account.username)
+        .ok_or_else(|| anyhow::anyhow!("Feder state is not initialized"))?;
+    let mut actor = serde_json::to_value(&feder.local_actor)?;
+    actor["url"] =
+        serde_json::Value::String(account.url.clone().unwrap_or_else(|| account.uri.clone()));
+
+    Ok(actor)
 }
 
 fn wants_activity_json(headers: &HeaderMap) -> bool {
