@@ -17,14 +17,17 @@ use feder_runtime_server::{
     AppState as FederState, InboxAuthPolicy, OutboundAddressPolicy, RuntimeConfig, StorageConfig,
     inbox::inbox as feder_inbox,
     send::ActivitySender,
+    storage::{RuntimeStore, StoredFollower},
     webfinger::{WebFingerQuery, webfinger as feder_webfinger},
 };
 use feder_vocab::{Actor, Endpoints, Iri, Reference};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
+use url::Url;
 
 const BIND: &str = "0.0.0.0:3000";
 const DB_PATH: &str = "microblog.sqlite3";
+const DEFAULT_PUBLIC_ORIGIN: &str = "https://fedora.tuatara-lenok.ts.net";
 
 #[derive(Clone)]
 struct AppState {
@@ -40,6 +43,12 @@ struct Account {
     handle: String,
     inbox_url: String,
     shared_inbox_url: Option<String>,
+}
+
+struct FollowerProfile {
+    uri: String,
+    name: Option<String>,
+    handle: String,
 }
 
 #[derive(Deserialize)]
@@ -64,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/.well-known/webfinger", get(webfinger))
         .route("/inbox", post(shared_inbox))
         .route("/users/{username}", get(profile))
+        .route("/users/{username}/followers", get(followers))
         .route("/users/{username}/inbox", post(personal_inbox))
         .layer(DefaultBodyLimit::max(1_048_576))
         .with_state(AppState {
@@ -210,11 +220,48 @@ async fn profile(
             .into_response());
     }
 
+    let follower_count = load_followers(&state, &account)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .len();
+
     Ok(Html(layout(&profile_html(
         &display_name(&account),
+        &account.username,
         &format!("@{}@{}", account.username, request_host(&headers)),
+        follower_count,
     )))
     .into_response())
+}
+
+async fn followers(
+    State(state): State<AppState>,
+    Path(username): Path<String>,
+) -> Result<Html<String>, StatusCode> {
+    let account = load_account_by_username(&state, &username)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let feder = current_feder(&state).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let stored_followers = load_followers_from_feder(&feder, &account)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut profiles = Vec::with_capacity(stored_followers.len());
+
+    for stored in stored_followers {
+        let uri = stored.follower.to_string();
+        let profile = match feder.actor_resolver.resolve(&stored.follower).await {
+            Ok(actor) => follower_profile(actor),
+            Err(error) => {
+                tracing::warn!(actor_id = %stored.follower, %error, "failed to resolve follower");
+                FollowerProfile {
+                    handle: uri.clone(),
+                    name: None,
+                    uri,
+                }
+            }
+        };
+        profiles.push(profile);
+    }
+
+    Ok(Html(layout(&followers_html(&profiles))))
 }
 
 async fn webfinger(
@@ -375,6 +422,76 @@ fn account_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
     })
 }
 
+fn current_feder(state: &AppState) -> anyhow::Result<FederState> {
+    state
+        .feder
+        .read()
+        .map_err(|_| anyhow::anyhow!("Feder state lock poisoned"))?
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Feder state is not initialized"))
+}
+
+fn load_followers(state: &AppState, account: &Account) -> anyhow::Result<Vec<StoredFollower>> {
+    let feder = current_feder(state)?;
+    load_followers_from_feder(&feder, account)
+}
+
+fn load_followers_from_feder(
+    feder: &FederState,
+    account: &Account,
+) -> anyhow::Result<Vec<StoredFollower>> {
+    let actor_id = public_actor_id(account)?;
+    let store = feder
+        .store
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Feder store lock poisoned"))?;
+    Ok(store.list_followers(&actor_id)?)
+}
+
+fn public_actor_id(account: &Account) -> anyhow::Result<Iri> {
+    let origin = std::env::var("FEDEROG_PUBLIC_ORIGIN")
+        .unwrap_or_else(|_| DEFAULT_PUBLIC_ORIGIN.to_string());
+    let origin = Url::parse(&origin)?;
+    if !matches!(origin.scheme(), "http" | "https")
+        || !origin.username().is_empty()
+        || origin.password().is_some()
+        || origin.host().is_none()
+        || !matches!(origin.path(), "" | "/")
+        || origin.query().is_some()
+        || origin.fragment().is_some()
+    {
+        anyhow::bail!("FEDEROG_PUBLIC_ORIGIN must be an HTTP(S) origin");
+    }
+
+    parse_iri(&format!(
+        "{}/users/{}",
+        origin.as_str().trim_end_matches('/'),
+        account.username
+    ))
+}
+
+fn follower_profile(actor: Actor) -> FollowerProfile {
+    let uri = actor.id.to_string();
+    let handle = actor
+        .preferred_username
+        .as_deref()
+        .zip(
+            Url::parse(&uri)
+                .ok()
+                .and_then(|url| url.host_str().map(ToOwned::to_owned)),
+        )
+        .map_or_else(
+            || uri.clone(),
+            |(username, host)| format!("@{username}@{host}"),
+        );
+
+    FollowerProfile {
+        uri,
+        name: actor.name.filter(|name| !name.is_empty()),
+        handle,
+    }
+}
+
 fn setup_form_html() -> String {
     r#"
     <h1>Set up your microblog</h1>
@@ -401,17 +518,46 @@ fn setup_form_html() -> String {
     .to_string()
 }
 
-fn profile_html(name: &str, handle: &str) -> String {
+fn profile_html(name: &str, username: &str, handle: &str, followers: usize) -> String {
+    let follower_label = if followers == 1 {
+        "1 follower".to_string()
+    } else {
+        format!("{followers} followers")
+    };
     format!(
         r#"
         <hgroup>
-            <h1>{}</h1>
-            <p style="user-select: all;">{}</p>
+            <h1><a href="/users/{}">{}</a></h1>
+            <p><span style="user-select: all;">{}</span> &middot; <a href="/users/{}/followers">{}</a></p>
         </hgroup>
         "#,
+        escape(username),
         escape(name),
-        escape(handle)
+        escape(handle),
+        escape(username),
+        follower_label
     )
+}
+
+fn followers_html(followers: &[FollowerProfile]) -> String {
+    let items = followers
+        .iter()
+        .map(|follower| {
+            let href = html_escape::encode_double_quoted_attribute(&follower.uri);
+            let handle = escape(&follower.handle);
+            match follower.name.as_deref() {
+                Some(name) => format!(
+                    r#"<li><a href="{href}">{}</a> <small>(<a href="{href}" class="secondary">{handle}</a>)</small></li>"#,
+                    escape(name)
+                ),
+                None => format!(
+                    r#"<li><a href="{href}" class="secondary">{handle}</a></li>"#
+                ),
+            }
+        })
+        .collect::<String>();
+
+    format!("<h2>Followers</h2><ul>{items}</ul>")
 }
 
 fn build_feder_state(account: &Account) -> anyhow::Result<FederState> {

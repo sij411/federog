@@ -1,3 +1,6 @@
+[env]
+FEDEROG_PUBLIC_ORIGIN = "https://fedora.tuatara-lenok.ts.net"
+
 [tools.rust]
 version = "1.95.0"
 profile = "default"
