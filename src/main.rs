@@ -12,16 +12,17 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
-use feder_core::{FederConfig, FederCore};
+use feder_core::{FederConfig, FederCore, UserCreateNote};
 use feder_runtime_server::{
     AppState as FederState, InboxAuthPolicy, OutboundAddressPolicy, RuntimeConfig, StorageConfig,
     followers::followers as feder_followers,
     inbox::inbox as feder_inbox,
+    object::get_object as feder_object,
     send::ActivitySender,
     storage::{RuntimeStore, StoredFollower},
     webfinger::{WebFingerQuery, webfinger as feder_webfinger},
 };
-use feder_vocab::{Actor, Endpoints, Iri, Reference};
+use feder_vocab::{Actor, Endpoints, Iri, Reference, References};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 use url::Url;
@@ -40,10 +41,7 @@ struct AppState {
 struct Account {
     username: String,
     name: Option<String>,
-    uri: String,
     handle: String,
-    inbox_url: String,
-    shared_inbox_url: Option<String>,
 }
 
 struct FollowerProfile {
@@ -193,10 +191,7 @@ async fn create_account(
     let account = Account {
         username: username.to_string(),
         name: Some(name.to_string()),
-        uri: actor_uri.clone(),
         handle,
-        inbox_url,
-        shared_inbox_url: Some(shared_inbox_url),
     };
     let Ok(feder) = build_feder_state(&account) else {
         return Redirect::to("/");
@@ -219,8 +214,7 @@ async fn profile(
         .ok_or(StatusCode::NOT_FOUND)?;
 
     if wants_activity_json(&headers) {
-        let actor = actor_json(&state, &account, &headers)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let actor = actor_json(&state, &account).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         return Ok((
             [(header::CONTENT_TYPE, "application/activity+json")],
             actor.to_string(),
@@ -255,8 +249,8 @@ async fn followers(
     let feder = current_feder(&state).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if wants_activity_json(&headers) {
-        let feder = feder_for_request(&state, &account, &headers)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let feder =
+            feder_for_account(&state, &account).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let response = feder_followers(State(feder), Path(username), headers.clone()).await?;
         if response.status() != StatusCode::NOT_ACCEPTABLE {
             return Ok(response);
@@ -343,6 +337,45 @@ async fn create_post(
         post_id
     };
 
+    let post = load_post(&state, &username, post_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let post_uri = parse_iri(&post.uri).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let followers_uri = parse_iri(&format!("{actor_uri}/followers"))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let create_id = parse_iri(&format!("{actor_uri}/activities/create/{post_id}"))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let feder =
+        feder_for_account(&state, &account).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let create_result = feder
+        .create_note(UserCreateNote {
+            note_id: post_uri.clone(),
+            create_id,
+            actor: Reference::id(
+                parse_iri(&actor_uri).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+            ),
+            to: References::one(
+                parse_iri("https://www.w3.org/ns/activitystreams#Public")
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+            ),
+            cc: References::one(followers_uri),
+            content: post.content,
+            media_type: Some("text/html".to_string()),
+            published: Some(post_timestamp(&post.created)),
+            url: Some(post_uri),
+        })
+        .await;
+    match create_result {
+        Ok(_) => {}
+        Err(feder_runtime_server::Error::ActivitySender(error)) => {
+            tracing::warn!(post_id, %error, "post persisted but delivery failed");
+        }
+        Err(error) => {
+            tracing::error!(post_id, %error, "failed to persist post for federation");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+
     Ok(Redirect::to(&format!("/users/{username}/posts/{post_id}")).into_response())
 }
 
@@ -354,6 +387,21 @@ async fn post_page(
     let account = load_account_by_username(&state, &username)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
+
+    if wants_activity_json(&headers) {
+        let feder =
+            feder_for_account(&state, &account).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let response = feder_object(
+            State(feder),
+            Path((username.clone(), id.to_string())),
+            headers.clone(),
+        )
+        .await?;
+        if response.status() != StatusCode::NOT_ACCEPTABLE {
+            return Ok(response);
+        }
+    }
+
     let post = load_post(&state, &username, id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -368,19 +416,22 @@ async fn post_page(
     );
     let post = post_html(&post, &account);
 
-    Ok(Html(layout(&format!("{profile}{post}"))).into_response())
+    Ok((
+        [(header::VARY, "Accept")],
+        Html(layout(&format!("{profile}{post}"))),
+    )
+        .into_response())
 }
 
 async fn webfinger(
     State(state): State<AppState>,
-    headers: HeaderMap,
     query: Query<WebFingerQuery>,
 ) -> Result<Response, StatusCode> {
     let account = load_account(&state)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
-    let feder = feder_for_request(&state, &account, &headers)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let feder =
+        feder_for_account(&state, &account).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     feder_webfinger(State(feder), query).await
 }
@@ -422,8 +473,8 @@ async fn handle_inbox(
     uri: Uri,
     body: Bytes,
 ) -> Result<Response, StatusCode> {
-    let feder = feder_for_request(&state, &account, &headers)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let feder =
+        feder_for_account(&state, &account).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let username = account.username;
     let activity = serde_json::from_slice::<serde_json::Value>(&body).ok();
     let activity_type = activity
@@ -482,10 +533,7 @@ fn load_account_from_db(db: &Connection) -> rusqlite::Result<Option<Account>> {
         SELECT
           users.username,
           actors.name,
-          actors.uri,
-          actors.handle,
-          actors.inbox_url,
-          actors.shared_inbox_url
+          actors.handle
         FROM users
         JOIN actors ON users.id = actors.user_id
         LIMIT 1
@@ -504,10 +552,7 @@ fn load_account_by_username(state: &AppState, username: &str) -> rusqlite::Resul
         SELECT
           users.username,
           actors.name,
-          actors.uri,
-          actors.handle,
-          actors.inbox_url,
-          actors.shared_inbox_url
+          actors.handle
         FROM users
         JOIN actors ON users.id = actors.user_id
         WHERE users.username = ?1
@@ -522,10 +567,7 @@ fn account_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
     Ok(Account {
         username: row.get(0)?,
         name: row.get(1)?,
-        uri: row.get(2)?,
-        handle: row.get(3)?,
-        inbox_url: row.get(4)?,
-        shared_inbox_url: row.get(5)?,
+        handle: row.get(2)?,
     })
 }
 
@@ -599,9 +641,19 @@ fn load_followers_from_feder(
 }
 
 fn public_actor_id(account: &Account) -> anyhow::Result<Iri> {
-    let origin = std::env::var("FEDEROG_PUBLIC_ORIGIN")
+    let origin = public_origin()?;
+
+    parse_iri(&format!(
+        "{}/users/{}",
+        origin.as_str().trim_end_matches('/'),
+        account.username
+    ))
+}
+
+fn public_origin() -> anyhow::Result<Url> {
+    let value = std::env::var("FEDEROG_PUBLIC_ORIGIN")
         .unwrap_or_else(|_| DEFAULT_PUBLIC_ORIGIN.to_string());
-    let origin = Url::parse(&origin)?;
+    let origin = Url::parse(&value)?;
     if !matches!(origin.scheme(), "http" | "https")
         || !origin.username().is_empty()
         || origin.password().is_some()
@@ -613,11 +665,17 @@ fn public_actor_id(account: &Account) -> anyhow::Result<Iri> {
         anyhow::bail!("FEDEROG_PUBLIC_ORIGIN must be an HTTP(S) origin");
     }
 
-    parse_iri(&format!(
-        "{}/users/{}",
-        origin.as_str().trim_end_matches('/'),
-        account.username
-    ))
+    Ok(origin)
+}
+
+fn public_handle_host() -> anyhow::Result<String> {
+    let origin = public_origin()?;
+    let host = origin
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("FEDEROG_PUBLIC_ORIGIN has no host"))?;
+    Ok(origin
+        .port()
+        .map_or_else(|| host.to_string(), |port| format!("{host}:{port}")))
 }
 
 fn follower_profile(actor: Actor) -> FollowerProfile {
@@ -763,6 +821,10 @@ fn post_html(post: &PostRecord, account: &Account) -> String {
     )
 }
 
+fn post_timestamp(created: &str) -> String {
+    format!("{}Z", created.replace(' ', "T").trim_end_matches('Z'))
+}
+
 fn sanitize_post_content(content: &str) -> String {
     escape(content)
         .replace("\r\n", "\n")
@@ -771,19 +833,18 @@ fn sanitize_post_content(content: &str) -> String {
 }
 
 fn build_feder_state(account: &Account) -> anyhow::Result<FederState> {
-    let outbox = format!("{}/outbox", account.uri);
+    let origin = public_origin()?;
+    let actor_id = public_actor_id(account)?;
+    let actor_uri = actor_id.to_string();
+    let inbox = format!("{actor_uri}/inbox");
+    let outbox = format!("{actor_uri}/outbox");
     let mut feder = FederState::from_config(RuntimeConfig {
         bind: BIND.parse()?,
-        actor_id: parse_iri(&account.uri)?,
-        inbox: parse_iri(&account.inbox_url)?,
+        actor_id,
+        inbox: parse_iri(&inbox)?,
         outbox: parse_iri(&outbox)?,
         username: account.username.clone(),
-        handle_host: account
-            .handle
-            .strip_prefix('@')
-            .and_then(|handle| handle.split_once('@'))
-            .map(|(_, host)| host.to_string())
-            .ok_or_else(|| anyhow::anyhow!("invalid actor handle: {}", account.handle))?,
+        handle_host: public_handle_host()?,
         inbox_auth_policy: InboxAuthPolicy::RequireSigned,
         outbound_address_policy: OutboundAddressPolicy::PublicOnly,
         storage: StorageConfig::Sqlite {
@@ -791,14 +852,12 @@ fn build_feder_state(account: &Account) -> anyhow::Result<FederState> {
         },
     })?;
     feder.local_actor.name = Some(display_name(account));
-    feder.local_actor.endpoints = account
-        .shared_inbox_url
-        .as_deref()
-        .map(parse_iri)
-        .transpose()?
-        .map(|shared_inbox| Endpoints {
-            shared_inbox: Some(shared_inbox),
-        });
+    feder.local_actor.endpoints = Some(Endpoints {
+        shared_inbox: Some(parse_iri(&format!(
+            "{}/inbox",
+            origin.as_str().trim_end_matches('/')
+        ))?),
+    });
 
     Ok(feder)
 }
@@ -809,33 +868,25 @@ fn parse_iri(value: &str) -> anyhow::Result<Iri> {
         .map_err(|error| anyhow::anyhow!("invalid IRI {value}: {error}"))
 }
 
-fn actor_json(
-    state: &AppState,
-    account: &Account,
-    headers: &HeaderMap,
-) -> anyhow::Result<serde_json::Value> {
-    let feder = feder_for_request(state, account, headers)?;
+fn actor_json(state: &AppState, account: &Account) -> anyhow::Result<serde_json::Value> {
+    let feder = feder_for_account(state, account)?;
     let mut actor = serde_json::to_value(&feder.local_actor)?;
     actor["url"] = serde_json::Value::String(feder.local_actor.id.to_string());
 
     Ok(actor)
 }
 
-fn feder_for_request(
-    state: &AppState,
-    account: &Account,
-    headers: &HeaderMap,
-) -> anyhow::Result<FederState> {
+fn feder_for_account(state: &AppState, account: &Account) -> anyhow::Result<FederState> {
     let mut feder = state
         .feder
         .read()
         .map_err(|_| anyhow::anyhow!("Feder state lock poisoned"))?
         .clone()
         .ok_or_else(|| anyhow::anyhow!("Feder state is not initialized"))?;
-    let actor = actor_for_request(&feder.local_actor, account, headers)?;
+    let actor = canonical_actor(&feder.local_actor, account)?;
     let actor_changed = actor.id != feder.local_actor.id;
 
-    feder.handle_host = request_host(headers).to_string();
+    feder.handle_host = public_handle_host()?;
     if actor_changed {
         let key_id = match actor.public_key.as_ref() {
             Some(Reference::Id(key_id)) => key_id.to_string(),
@@ -860,19 +911,19 @@ fn feder_for_request(
     Ok(feder)
 }
 
-fn actor_for_request(
-    actor: &Actor,
-    account: &Account,
-    headers: &HeaderMap,
-) -> anyhow::Result<Actor> {
+fn canonical_actor(actor: &Actor, account: &Account) -> anyhow::Result<Actor> {
     let mut actor = actor.clone();
-    let actor_uri = format!("{}/users/{}", request_origin(headers), account.username);
+    let origin = public_origin()?;
+    let actor_uri = public_actor_id(account)?.to_string();
     actor.id = parse_iri(&actor_uri)?;
     actor.inbox = parse_iri(&format!("{actor_uri}/inbox"))?;
     actor.outbox = parse_iri(&format!("{actor_uri}/outbox"))?;
     actor.followers = Some(parse_iri(&format!("{actor_uri}/followers"))?);
     actor.endpoints = Some(Endpoints {
-        shared_inbox: Some(parse_iri(&format!("{}/inbox", request_origin(headers)))?),
+        shared_inbox: Some(parse_iri(&format!(
+            "{}/inbox",
+            origin.as_str().trim_end_matches('/')
+        ))?),
     });
 
     match actor.public_key.as_mut() {
@@ -894,7 +945,9 @@ fn wants_activity_json(headers: &HeaderMap) -> bool {
         .get(header::ACCEPT)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|accept| {
-            accept.contains("application/activity+json") || accept.contains("application/ld+json")
+            accept.contains("application/activity+json")
+                || accept.contains("application/ld+json")
+                || accept.contains("application/json")
         })
 }
 
