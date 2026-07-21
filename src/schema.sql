@@ -22,3 +22,12 @@ CREATE TABLE IF NOT EXISTS actors (
   created          TEXT    NOT NULL DEFAULT (CURRENT_TIMESTAMP)
                                            CHECK (created <> '')
 );
+
+CREATE TABLE IF NOT EXISTS posts (
+  id       INTEGER NOT NULL PRIMARY KEY,
+  uri      TEXT    NOT NULL UNIQUE CHECK (uri <> ''),
+  actor_id INTEGER NOT NULL REFERENCES actors (id),
+  content  TEXT    NOT NULL,
+  url      TEXT             CHECK (url LIKE 'https://%' OR url LIKE 'http://%'),
+  created  TEXT    NOT NULL DEFAULT (CURRENT_TIMESTAMP) CHECK (created <> '')
+);

@@ -52,10 +52,22 @@ struct FollowerProfile {
     handle: String,
 }
 
+struct PostRecord {
+    uri: String,
+    content: String,
+    url: Option<String>,
+    created: String,
+}
+
 #[derive(Deserialize)]
 struct SetupForm {
     username: String,
     name: String,
+}
+
+#[derive(Deserialize)]
+struct PostForm {
+    content: String,
 }
 
 #[tokio::main]
@@ -76,6 +88,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/users/{username}", get(profile))
         .route("/users/{username}/followers", get(followers))
         .route("/users/{username}/inbox", post(personal_inbox))
+        .route("/users/{username}/posts", post(create_post))
+        .route("/users/{username}/posts/{id}", get(post_page))
         .layer(DefaultBodyLimit::max(1_048_576))
         .with_state(AppState {
             db: Arc::new(Mutex::new(db)),
@@ -104,14 +118,7 @@ async fn home(State(state): State<AppState>) -> Result<Html<String>, Redirect> {
         return Err(Redirect::to("/setup"));
     };
 
-    Ok(Html(layout(&format!(
-        r#"
-        <h1>Microblog</h1>
-        <p>Account <a href="/users/{}"><strong>{}</strong></a> is set up.</p>
-        "#,
-        escape(&account.username),
-        escape(&display_name(&account))
-    ))))
+    Ok(Html(layout(&home_html(&account))))
 }
 
 async fn setup_form(State(state): State<AppState>) -> Result<Html<String>, Redirect> {
@@ -224,14 +231,17 @@ async fn profile(
     let follower_count = load_followers(&state, &account)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .len();
-
-    Ok(Html(layout(&profile_html(
+    let posts =
+        load_posts(&state, &account.username).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let profile = profile_html(
         &display_name(&account),
         &account.username,
         &format!("@{}@{}", account.username, request_host(&headers)),
         follower_count,
-    )))
-    .into_response())
+    );
+    let posts = post_list_html(&posts, &account);
+
+    Ok(Html(layout(&format!("{profile}{posts}"))).into_response())
 }
 
 async fn followers(
@@ -278,6 +288,87 @@ async fn followers(
         Html(layout(&followers_html(&profiles))),
     )
         .into_response())
+}
+
+async fn create_post(
+    State(state): State<AppState>,
+    Path(username): Path<String>,
+    Form(form): Form<PostForm>,
+) -> Result<Response, StatusCode> {
+    let account = load_account_by_username(&state, &username)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let content = form.content.trim();
+    if content.is_empty() {
+        return Ok((StatusCode::BAD_REQUEST, "Content is required").into_response());
+    }
+
+    let actor_uri = public_actor_id(&account)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .to_string();
+    let content = sanitize_post_content(content);
+    let post_id = {
+        let mut db = state
+            .db
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let tx = db
+            .transaction()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let actor_id: i64 = tx
+            .query_row(
+                r#"
+                SELECT actors.id
+                FROM actors
+                JOIN users ON users.id = actors.user_id
+                WHERE users.username = ?1
+                "#,
+                params![username],
+                |row| row.get(0),
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        tx.execute(
+            "INSERT INTO posts (uri, actor_id, content) VALUES ('https://localhost/', ?1, ?2)",
+            params![actor_id, content],
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let post_id = tx.last_insert_rowid();
+        let post_uri = format!("{actor_uri}/posts/{post_id}");
+        tx.execute(
+            "UPDATE posts SET uri = ?1, url = ?1 WHERE id = ?2",
+            params![post_uri, post_id],
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        tx.commit().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        post_id
+    };
+
+    Ok(Redirect::to(&format!("/users/{username}/posts/{post_id}")).into_response())
+}
+
+async fn post_page(
+    State(state): State<AppState>,
+    Path((username, id)): Path<(String, i64)>,
+    headers: HeaderMap,
+) -> Result<Response, StatusCode> {
+    let account = load_account_by_username(&state, &username)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let post = load_post(&state, &username, id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let follower_count = load_followers(&state, &account)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .len();
+    let profile = profile_html(
+        &display_name(&account),
+        &account.username,
+        &format!("@{}@{}", account.username, request_host(&headers)),
+        follower_count,
+    );
+    let post = post_html(&post, &account);
+
+    Ok(Html(layout(&format!("{profile}{post}"))).into_response())
 }
 
 async fn webfinger(
@@ -438,6 +529,49 @@ fn account_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
     })
 }
 
+fn load_posts(state: &AppState, username: &str) -> rusqlite::Result<Vec<PostRecord>> {
+    let db = state.db.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let mut statement = db.prepare(
+        r#"
+        SELECT posts.uri, posts.content, posts.url, posts.created
+        FROM posts
+        JOIN actors ON actors.id = posts.actor_id
+        JOIN users ON users.id = actors.user_id
+        WHERE users.username = ?1
+        ORDER BY posts.created DESC, posts.id DESC
+        "#,
+    )?;
+    let posts = statement.query_map(params![username], post_from_row)?;
+
+    posts.collect()
+}
+
+fn load_post(state: &AppState, username: &str, id: i64) -> rusqlite::Result<Option<PostRecord>> {
+    let db = state.db.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
+
+    db.query_row(
+        r#"
+        SELECT posts.uri, posts.content, posts.url, posts.created
+        FROM posts
+        JOIN actors ON actors.id = posts.actor_id
+        JOIN users ON users.id = actors.user_id
+        WHERE users.username = ?1 AND posts.id = ?2
+        "#,
+        params![username, id],
+        post_from_row,
+    )
+    .optional()
+}
+
+fn post_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PostRecord> {
+    Ok(PostRecord {
+        uri: row.get(0)?,
+        content: row.get(1)?,
+        url: row.get(2)?,
+        created: row.get(3)?,
+    })
+}
+
 fn current_feder(state: &AppState) -> anyhow::Result<FederState> {
     state
         .feder
@@ -534,6 +668,29 @@ fn setup_form_html() -> String {
     .to_string()
 }
 
+fn home_html(account: &Account) -> String {
+    format!(
+        r#"
+        <hgroup>
+            <h1>{}'s microblog</h1>
+            <p><a href="/users/{}">{}'s profile</a></p>
+        </hgroup>
+        <form method="post" action="/users/{}/posts">
+            <fieldset>
+                <label>
+                    <textarea name="content" required placeholder="What's up?"></textarea>
+                </label>
+            </fieldset>
+            <input type="submit" value="Post" />
+        </form>
+        "#,
+        escape(&display_name(account)),
+        escape(&account.username),
+        escape(&display_name(account)),
+        escape(&account.username),
+    )
+}
+
 fn profile_html(name: &str, username: &str, handle: &str, followers: usize) -> String {
     let follower_label = if followers == 1 {
         "1 follower".to_string()
@@ -574,6 +731,43 @@ fn followers_html(followers: &[FollowerProfile]) -> String {
         .collect::<String>();
 
     format!("<h2>Followers</h2><ul>{items}</ul>")
+}
+
+fn post_list_html(posts: &[PostRecord], account: &Account) -> String {
+    posts.iter().map(|post| post_html(post, account)).collect()
+}
+
+fn post_html(post: &PostRecord, account: &Account) -> String {
+    let href = html_escape::encode_double_quoted_attribute(
+        post.url.as_deref().unwrap_or(post.uri.as_str()),
+    );
+    let datetime = format!("{}Z", post.created.replace(' ', "T"));
+    let datetime = html_escape::encode_double_quoted_attribute(&datetime);
+
+    format!(
+        r#"
+        <article>
+            <header>
+                <a href="/users/{}">{}</a>
+                <small>(<span class="secondary">{}</span>)</small>
+            </header>
+            <div>{}</div>
+            <footer><a href="{href}"><time datetime="{datetime}">{}</time></a></footer>
+        </article>
+        "#,
+        escape(&account.username),
+        escape(&display_name(account)),
+        escape(&account.handle),
+        post.content,
+        escape(&post.created),
+    )
+}
+
+fn sanitize_post_content(content: &str) -> String {
+    escape(content)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\n', "<br>\n")
 }
 
 fn build_feder_state(account: &Account) -> anyhow::Result<FederState> {
