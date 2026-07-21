@@ -15,6 +15,7 @@ use axum::{
 use feder_core::{FederConfig, FederCore};
 use feder_runtime_server::{
     AppState as FederState, InboxAuthPolicy, OutboundAddressPolicy, RuntimeConfig, StorageConfig,
+    followers::followers as feder_followers,
     inbox::inbox as feder_inbox,
     send::ActivitySender,
     storage::{RuntimeStore, StoredFollower},
@@ -236,11 +237,22 @@ async fn profile(
 async fn followers(
     State(state): State<AppState>,
     Path(username): Path<String>,
-) -> Result<Html<String>, StatusCode> {
+    headers: HeaderMap,
+) -> Result<Response, StatusCode> {
     let account = load_account_by_username(&state, &username)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
     let feder = current_feder(&state).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if wants_activity_json(&headers) {
+        let feder = feder_for_request(&state, &account, &headers)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let response = feder_followers(State(feder), Path(username), headers.clone()).await?;
+        if response.status() != StatusCode::NOT_ACCEPTABLE {
+            return Ok(response);
+        }
+    }
+
     let stored_followers = load_followers_from_feder(&feder, &account)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut profiles = Vec::with_capacity(stored_followers.len());
@@ -261,7 +273,11 @@ async fn followers(
         profiles.push(profile);
     }
 
-    Ok(Html(layout(&followers_html(&profiles))))
+    Ok((
+        [(header::VARY, "Accept")],
+        Html(layout(&followers_html(&profiles))),
+    )
+        .into_response())
 }
 
 async fn webfinger(
@@ -660,6 +676,7 @@ fn actor_for_request(
     actor.id = parse_iri(&actor_uri)?;
     actor.inbox = parse_iri(&format!("{actor_uri}/inbox"))?;
     actor.outbox = parse_iri(&format!("{actor_uri}/outbox"))?;
+    actor.followers = Some(parse_iri(&format!("{actor_uri}/followers"))?);
     actor.endpoints = Some(Endpoints {
         shared_inbox: Some(parse_iri(&format!("{}/inbox", request_origin(headers)))?),
     });
