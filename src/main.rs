@@ -12,7 +12,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
-use feder_core::{FederConfig, FederCore, UserCreateNote};
+use feder_core::{Activity, FederConfig, FederCore, Recipients, SendActivity, UserCreateNote};
 use feder_runtime_server::{
     AppState as FederState, InboxAuthPolicy, OutboundAddressPolicy, RuntimeConfig, StorageConfig,
     followers::followers as feder_followers,
@@ -22,7 +22,7 @@ use feder_runtime_server::{
     storage::{RuntimeStore, StoredFollower},
     webfinger::{WebFingerQuery, webfinger as feder_webfinger},
 };
-use feder_vocab::{Actor, Endpoints, Iri, Reference, References};
+use feder_vocab::{Actor, Endpoints, Follow, Iri, Reference, References};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 use url::Url;
@@ -68,6 +68,11 @@ struct PostForm {
     content: String,
 }
 
+#[derive(Deserialize)]
+struct FollowForm {
+    actor: String,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let log_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -85,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/inbox", post(shared_inbox))
         .route("/users/{username}", get(profile))
         .route("/users/{username}/followers", get(followers))
+        .route("/users/{username}/following", post(follow_actor))
         .route("/users/{username}/inbox", post(personal_inbox))
         .route("/users/{username}/posts", post(create_post))
         .route("/users/{username}/posts/{id}", get(post_page))
@@ -379,6 +385,70 @@ async fn create_post(
     Ok(Redirect::to(&format!("/users/{username}/posts/{post_id}")).into_response())
 }
 
+async fn follow_actor(
+    State(state): State<AppState>,
+    Path(username): Path<String>,
+    Form(form): Form<FollowForm>,
+) -> Result<Response, StatusCode> {
+    let account = load_account_by_username(&state, &username)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let actor_url = form.actor.trim();
+    let actor_url = match Url::parse(actor_url) {
+        Ok(url)
+            if matches!(url.scheme(), "http" | "https")
+                && url.host().is_some()
+                && url.username().is_empty()
+                && url.password().is_none() =>
+        {
+            url
+        }
+        _ => return Ok((StatusCode::BAD_REQUEST, "Invalid actor URL").into_response()),
+    };
+    let actor_id = parse_iri(actor_url.as_str()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let feder =
+        feder_for_account(&state, &account).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let actor = feder
+        .actor_resolver
+        .resolve(&actor_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%actor_id, %error, "failed to resolve actor for follow");
+            StatusCode::BAD_GATEWAY
+        })?;
+    let inbox = actor
+        .endpoints
+        .as_ref()
+        .and_then(|endpoints| endpoints.shared_inbox.clone())
+        .unwrap_or_else(|| actor.inbox.clone());
+    let token = random_activity_token(&state).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let follow_id = parse_iri(&format!(
+        "{}/activities/follow/{token}",
+        feder.local_actor.id.as_str().trim_end_matches('/')
+    ))
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let follow = Follow::new(
+        follow_id.clone(),
+        Reference::id(feder.local_actor.id.clone()),
+        Reference::id(actor.id.clone()),
+    );
+
+    feder
+        .activity_sender
+        .send_actions(&[SendActivity {
+            activity: Activity::Follow(follow),
+            recipients: Recipients::Inbox(inbox),
+        }])
+        .await
+        .map_err(|error| {
+            tracing::warn!(%follow_id, remote_actor = %actor.id, %error, "failed to send Follow");
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    tracing::info!(%follow_id, remote_actor = %actor.id, "sent Follow");
+    Ok(Redirect::to("/").into_response())
+}
+
 async fn post_page(
     State(state): State<AppState>,
     Path((username, id)): Path<(String, i64)>,
@@ -605,6 +675,11 @@ fn load_post(state: &AppState, username: &str, id: i64) -> rusqlite::Result<Opti
     .optional()
 }
 
+fn random_activity_token(state: &AppState) -> rusqlite::Result<String> {
+    let db = state.db.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
+    db.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))
+}
+
 fn post_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PostRecord> {
     Ok(PostRecord {
         uri: row.get(0)?,
@@ -733,6 +808,17 @@ fn home_html(account: &Account) -> String {
             <h1>{}'s microblog</h1>
             <p><a href="/users/{}">{}'s profile</a></p>
         </hgroup>
+        <form method="post" action="/users/{}/following">
+            <fieldset role="group">
+                <input
+                    type="url"
+                    name="actor"
+                    required
+                    placeholder="https://example.com/users/alice"
+                />
+                <input type="submit" value="Follow" />
+            </fieldset>
+        </form>
         <form method="post" action="/users/{}/posts">
             <fieldset>
                 <label>
@@ -745,6 +831,7 @@ fn home_html(account: &Account) -> String {
         escape(&display_name(account)),
         escape(&account.username),
         escape(&display_name(account)),
+        escape(&account.username),
         escape(&account.username),
     )
 }
