@@ -27,7 +27,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 use url::Url;
 
-const BIND: &str = "0.0.0.0:3000";
+const PUBLIC_BIND: &str = "0.0.0.0:3000";
+const ADMIN_BIND: &str = "127.0.0.1:3001";
 const DB_PATH: &str = "microblog.sqlite3";
 const DEFAULT_PUBLIC_ORIGIN: &str = "https://fedora.tuatara-lenok.ts.net";
 
@@ -83,30 +84,51 @@ async fn main() -> anyhow::Result<()> {
     let feder = load_account_from_db(&db)?
         .map(|account| build_feder_state(&account))
         .transpose()?;
-    let app = Router::new()
-        .route("/", get(home))
-        .route("/setup", get(setup_form).post(create_account))
+    let state = AppState {
+        db: Arc::new(Mutex::new(db)),
+        feder: Arc::new(RwLock::new(feder)),
+    };
+    let public_app = Router::new()
+        .route("/", get(public_home))
         .route("/.well-known/webfinger", get(webfinger))
         .route("/inbox", post(shared_inbox))
         .route("/users/{username}", get(profile))
         .route("/users/{username}/followers", get(followers))
-        .route("/users/{username}/following", post(follow_actor))
         .route("/users/{username}/inbox", post(personal_inbox))
+        .route("/users/{username}/posts/{id}", get(post_page))
+        .layer(DefaultBodyLimit::max(1_048_576))
+        .with_state(state.clone());
+    let admin_app = Router::new()
+        .route("/", get(home))
+        .route("/setup", get(setup_form).post(create_account))
+        .route("/users/{username}", get(profile))
+        .route("/users/{username}/followers", get(followers))
+        .route("/users/{username}/following", post(follow_actor))
         .route("/users/{username}/posts", post(create_post))
         .route("/users/{username}/posts/{id}", get(post_page))
         .layer(DefaultBodyLimit::max(1_048_576))
-        .with_state(AppState {
-            db: Arc::new(Mutex::new(db)),
-            feder: Arc::new(RwLock::new(feder)),
-        });
+        .with_state(state);
 
-    let bind: SocketAddr = BIND.parse()?;
-    tracing::info!(bind = %bind, "starting federog");
+    let public_bind: SocketAddr = PUBLIC_BIND.parse()?;
+    let admin_bind: SocketAddr = ADMIN_BIND.parse()?;
+    tracing::info!(bind = %public_bind, "starting public federog listener");
+    tracing::info!(bind = %admin_bind, "starting private federog admin listener");
 
-    let listener = tokio::net::TcpListener::bind(bind).await?;
-    axum::serve(listener, app).await?;
+    let public_listener = tokio::net::TcpListener::bind(public_bind).await?;
+    let admin_listener = tokio::net::TcpListener::bind(admin_bind).await?;
+    tokio::try_join!(
+        axum::serve(public_listener, public_app),
+        axum::serve(admin_listener, admin_app),
+    )?;
 
     Ok(())
+}
+
+async fn public_home(State(state): State<AppState>) -> Result<Redirect, StatusCode> {
+    let account = load_account(&state)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Redirect::to(&format!("/users/{}", account.username)))
 }
 
 fn open_db(path: &str) -> rusqlite::Result<Connection> {
@@ -926,7 +948,7 @@ fn build_feder_state(account: &Account) -> anyhow::Result<FederState> {
     let inbox = format!("{actor_uri}/inbox");
     let outbox = format!("{actor_uri}/outbox");
     let mut feder = FederState::from_config(RuntimeConfig {
-        bind: BIND.parse()?,
+        bind: PUBLIC_BIND.parse()?,
         actor_id,
         inbox: parse_iri(&inbox)?,
         outbox: parse_iri(&outbox)?,
@@ -1046,7 +1068,7 @@ fn request_host(headers: &HeaderMap) -> &str {
         .and_then(|value| value.split(',').next())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(BIND)
+        .unwrap_or(PUBLIC_BIND)
 }
 
 fn request_origin(headers: &HeaderMap) -> String {

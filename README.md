@@ -5,12 +5,10 @@ runtime crate while following the shape of Fedify's microblog tutorial.
 
 It currently provides:
 
-- A local HTML composer at `/`
-- The ActivityPub actor at `/users/alice`
-- The inbox at `/users/alice/inbox`
-- WebFinger at `/.well-known/webfinger?resource=acct:alice@127.0.0.1:3000`
-- A minimal outbox collection at `/users/alice/outbox`
-- A local followers page at `/users/alice/followers`
+- A loopback-only HTML composer and follow form
+- Public ActivityPub actor, follower, post, and inbox endpoints
+- WebFinger discovery for the configured public origin
+- Signed Follow, Accept, and Create activity delivery
 
 Run it with:
 
@@ -18,13 +16,14 @@ Run it with:
 cargo run
 ```
 
-Then open <http://127.0.0.1:3000/>.
+The public ActivityPub listener binds to `0.0.0.0:3000`.  Owner actions are
+available only from the admin listener at <http://127.0.0.1:3001/>.
 
-Known Feder runtime gaps surfaced by this app:
+To use the admin listener remotely, forward it over SSH:
 
-- Created notes are kept in memory because `SqliteStore` does not persist
-  `StoreObject` actions yet.
-- `SendActivity` actions are produced by `feder-core`, but the server runtime
-  does not deliver them to remote inboxes yet.
-- The runtime router is not yet easy to compose with application-specific state,
-  so Federog wires the exported runtime handlers manually.
+```sh
+ssh -L 3001:127.0.0.1:3001 fedora
+```
+
+Then open <http://127.0.0.1:3001/> locally.  Do not expose port 3001 through a
+public tunnel or reverse proxy.
