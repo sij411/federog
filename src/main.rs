@@ -22,7 +22,7 @@ use feder_runtime_server::{
     storage::{RuntimeStore, StoredFollower},
     webfinger::{WebFingerQuery, webfinger as feder_webfinger},
 };
-use feder_vocab::{Actor, Endpoints, Follow, Iri, Reference, References};
+use feder_vocab::{Actor, Endpoints, Follow, Iri, Note, Reference, References};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 use url::Url;
@@ -58,6 +58,11 @@ struct PostRecord {
     created: String,
 }
 
+struct TimelinePost {
+    post: PostRecord,
+    author: ActorProfile,
+}
+
 #[derive(Deserialize)]
 struct SetupForm {
     username: String,
@@ -72,6 +77,12 @@ struct PostForm {
 #[derive(Deserialize)]
 struct FollowForm {
     actor: String,
+}
+
+#[derive(Deserialize)]
+struct IncomingCreateNote {
+    actor: Reference<Actor>,
+    object: Reference<Note>,
 }
 
 #[tokio::main]
@@ -94,7 +105,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/inbox", post(shared_inbox))
         .route("/users/{username}", get(profile))
         .route("/users/{username}/followers", get(followers))
-        .route("/users/{username}/following", get(following))
+        .route(
+            "/users/{username}/following",
+            get(following).post(follow_actor),
+        )
         .route("/users/{username}/inbox", post(personal_inbox))
         .route("/users/{username}/posts/{id}", get(post_page))
         .layer(DefaultBodyLimit::max(1_048_576))
@@ -104,10 +118,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/setup", get(setup_form).post(create_account))
         .route("/users/{username}", get(profile))
         .route("/users/{username}/followers", get(followers))
-        .route(
-            "/users/{username}/following",
-            get(following).post(follow_actor),
-        )
+        .route("/users/{username}/following", get(following))
         .route("/users/{username}/posts", post(create_post))
         .route("/users/{username}/posts/{id}", get(post_page))
         .layer(DefaultBodyLimit::max(1_048_576))
@@ -128,11 +139,14 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn public_home(State(state): State<AppState>) -> Result<Redirect, StatusCode> {
+async fn public_home(State(state): State<AppState>) -> Result<Html<String>, StatusCode> {
     let account = load_account(&state)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Redirect::to(&format!("/users/{}", account.username)))
+    let posts =
+        load_timeline(&state, &account.username).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Html(layout(&public_home_html(&account, &posts))))
 }
 
 fn open_db(path: &str) -> rusqlite::Result<Connection> {
@@ -147,8 +161,7 @@ async fn home(State(state): State<AppState>) -> Result<Html<String>, Redirect> {
     let Some(account) = load_account(&state).map_err(|_| Redirect::to("/setup"))? else {
         return Err(Redirect::to("/setup"));
     };
-
-    Ok(Html(layout(&home_html(&account))))
+    Ok(Html(layout(&post_form_html(&account))))
 }
 
 async fn setup_form(State(state): State<AppState>) -> Result<Html<String>, Redirect> {
@@ -599,7 +612,7 @@ async fn handle_inbox(
 ) -> Result<Response, StatusCode> {
     let feder =
         feder_for_account(&state, &account).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let username = account.username;
+    let username = account.username.clone();
     let activity = serde_json::from_slice::<serde_json::Value>(&body).ok();
     let activity_type = activity
         .as_ref()
@@ -630,13 +643,115 @@ async fn handle_inbox(
         "received inbox request"
     );
 
-    let result = feder_inbox(State(feder), Path(username), headers, method, uri, body).await;
+    let result = feder_inbox(
+        State(feder.clone()),
+        Path(username),
+        headers,
+        method,
+        uri,
+        body,
+    )
+    .await;
     match &result {
         Ok(response) => tracing::info!(status = %response.status(), "handled inbox request"),
         Err(status) => tracing::warn!(status = %status, "rejected inbox request"),
     }
 
-    result
+    let response = result?;
+    if response.status().is_success()
+        && activity_type == Some("Create")
+        && let Some(activity) = activity
+    {
+        receive_create_note(&state, &account, activity).inspect_err(|status| {
+            tracing::warn!(%status, "failed to store incoming Create(Note)");
+        })?;
+    }
+
+    Ok(response)
+}
+
+fn receive_create_note(
+    state: &AppState,
+    account: &Account,
+    activity: serde_json::Value,
+) -> Result<(), StatusCode> {
+    if activity
+        .get("object")
+        .and_then(|object| object.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| kind != "Note")
+    {
+        return Ok(());
+    }
+    let create: IncomingCreateNote =
+        serde_json::from_value(activity).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let actor_id = actor_reference_id(&create.actor);
+    let Reference::Object(note) = create.object else {
+        tracing::warn!(%actor_id, "ignored Create with a linked object");
+        return Ok(());
+    };
+    let Some(attributed_to) = note.attributed_to.as_ref().map(actor_reference_id) else {
+        return Ok(());
+    };
+    if attributed_to != actor_id {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let note_url =
+        validated_http_iri(note.url.as_ref().unwrap_or(&note.id)).ok_or(StatusCode::BAD_REQUEST)?;
+    validated_http_iri(&note.id).ok_or(StatusCode::BAD_REQUEST)?;
+    let content = ammonia::clean(note.content.as_deref().unwrap_or(""));
+
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let actor_id_in_db: Option<i64> = db
+        .query_row(
+            r#"
+            SELECT following.id
+            FROM follows
+            JOIN actors AS follower ON follower.id = follows.follower_id
+            JOIN actors AS following ON following.id = follows.following_id
+            JOIN users ON users.id = follower.user_id
+            WHERE users.username = ?1 AND following.uri = ?2
+            "#,
+            params![account.username, actor_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let Some(actor_id_in_db) = actor_id_in_db else {
+        tracing::info!(%actor_id, "ignored Create from an actor that is not followed");
+        return Ok(());
+    };
+    db.execute(
+        r#"
+        INSERT INTO posts (uri, actor_id, content, url)
+        VALUES (?1, ?2, ?3, ?4)
+        ON CONFLICT(uri) DO NOTHING
+        "#,
+        params![note.id.to_string(), actor_id_in_db, content, note_url],
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    tracing::info!(note_id = %note.id, %actor_id, "stored remote Note");
+    Ok(())
+}
+
+fn actor_reference_id(reference: &Reference<Actor>) -> &Iri {
+    match reference {
+        Reference::Id(actor_id) => actor_id,
+        Reference::Object(actor) => &actor.id,
+    }
+}
+
+fn validated_http_iri(iri: &Iri) -> Option<String> {
+    let url = Url::parse(iri.as_str()).ok()?;
+    (matches!(url.scheme(), "http" | "https")
+        && url.host().is_some()
+        && url.username().is_empty()
+        && url.password().is_none())
+    .then(|| url.to_string())
 }
 
 fn reference_id(value: &serde_json::Value) -> Option<&str> {
@@ -727,6 +842,55 @@ fn load_post(state: &AppState, username: &str, id: i64) -> rusqlite::Result<Opti
         post_from_row,
     )
     .optional()
+}
+
+fn load_timeline(state: &AppState, username: &str) -> rusqlite::Result<Vec<TimelinePost>> {
+    let db = state.db.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let mut statement = db.prepare(
+        r#"
+        SELECT
+          posts.uri,
+          posts.content,
+          posts.url,
+          posts.created,
+          CASE
+            WHEN authors.user_id IS NULL THEN authors.uri
+            ELSE '/users/' || author_users.username
+          END,
+          authors.name,
+          authors.handle
+        FROM posts
+        JOIN actors AS authors ON authors.id = posts.actor_id
+        LEFT JOIN users AS author_users ON author_users.id = authors.user_id
+        WHERE authors.user_id = (
+          SELECT id FROM users WHERE username = ?1
+        ) OR authors.id IN (
+          SELECT follows.following_id
+          FROM follows
+          JOIN actors AS follower ON follower.id = follows.follower_id
+          JOIN users ON users.id = follower.user_id
+          WHERE users.username = ?1
+        )
+        ORDER BY posts.created DESC, posts.id DESC
+        "#,
+    )?;
+    let posts = statement.query_map(params![username], |row| {
+        Ok(TimelinePost {
+            post: PostRecord {
+                uri: row.get(0)?,
+                content: row.get(1)?,
+                url: row.get(2)?,
+                created: row.get(3)?,
+            },
+            author: ActorProfile {
+                uri: row.get(4)?,
+                name: row.get(5)?,
+                handle: row.get(6)?,
+            },
+        })
+    })?;
+
+    posts.collect()
 }
 
 fn random_activity_token(state: &AppState) -> rusqlite::Result<String> {
@@ -955,12 +1119,12 @@ fn setup_form_html() -> String {
     .to_string()
 }
 
-fn home_html(account: &Account) -> String {
+fn public_home_html(account: &Account, posts: &[TimelinePost]) -> String {
     format!(
         r#"
         <hgroup>
-            <h1>{}'s microblog</h1>
-            <p><a href="/users/{}">{}'s profile</a></p>
+            <h1>{}'s timeline</h1>
+            <p><a href="/users/{}">View profile</a></p>
         </hgroup>
         <form method="post" action="/users/{}/following">
             <fieldset role="group">
@@ -973,6 +1137,23 @@ fn home_html(account: &Account) -> String {
                 <input type="submit" value="Follow" />
             </fieldset>
         </form>
+        <h2>Timeline</h2>
+        {}
+        "#,
+        escape(&display_name(account)),
+        escape(&account.username),
+        escape(&account.username),
+        timeline_html(posts),
+    )
+}
+
+fn post_form_html(account: &Account) -> String {
+    format!(
+        r#"
+        <hgroup>
+            <h1>New post</h1>
+            <p><a href="/users/{}">View profile</a></p>
+        </hgroup>
         <form method="post" action="/users/{}/posts">
             <fieldset>
                 <label>
@@ -982,9 +1163,6 @@ fn home_html(account: &Account) -> String {
             <input type="submit" value="Post" />
         </form>
         "#,
-        escape(&display_name(account)),
-        escape(&account.username),
-        escape(&display_name(account)),
         escape(&account.username),
         escape(&account.username),
     )
@@ -1049,9 +1227,26 @@ fn post_list_html(posts: &[PostRecord], account: &Account) -> String {
 }
 
 fn post_html(post: &PostRecord, account: &Account) -> String {
+    let author = ActorProfile {
+        uri: format!("/users/{}", account.username),
+        name: account.name.clone(),
+        handle: account.handle.clone(),
+    };
+    post_html_with_author(post, &author)
+}
+
+fn timeline_html(posts: &[TimelinePost]) -> String {
+    posts
+        .iter()
+        .map(|entry| post_html_with_author(&entry.post, &entry.author))
+        .collect()
+}
+
+fn post_html_with_author(post: &PostRecord, author: &ActorProfile) -> String {
     let href = html_escape::encode_double_quoted_attribute(
         post.url.as_deref().unwrap_or(post.uri.as_str()),
     );
+    let author_href = html_escape::encode_double_quoted_attribute(&author.uri);
     let datetime = format!("{}Z", post.created.replace(' ', "T"));
     let datetime = html_escape::encode_double_quoted_attribute(&datetime);
 
@@ -1059,16 +1254,15 @@ fn post_html(post: &PostRecord, account: &Account) -> String {
         r#"
         <article>
             <header>
-                <a href="/users/{}">{}</a>
+                <a href="{author_href}">{}</a>
                 <small>(<span class="secondary">{}</span>)</small>
             </header>
             <div>{}</div>
             <footer><a href="{href}"><time datetime="{datetime}">{}</time></a></footer>
         </article>
         "#,
-        escape(&account.username),
-        escape(&display_name(account)),
-        escape(&account.handle),
+        escape(author.name.as_deref().unwrap_or(&author.handle)),
+        escape(&author.handle),
         post.content,
         escape(&post.created),
     )

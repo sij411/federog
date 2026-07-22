@@ -5,6 +5,7 @@ edition = "2024"
 license = "AGPL-3.0-only"
 
 [dependencies]
+ammonia = "4.1.3"
 axum = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 feder-core = { path = "../feder/crates/feder-core" }
