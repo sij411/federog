@@ -45,7 +45,7 @@ struct Account {
     handle: String,
 }
 
-struct FollowerProfile {
+struct ActorProfile {
     uri: String,
     name: Option<String>,
     handle: String,
@@ -94,6 +94,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/inbox", post(shared_inbox))
         .route("/users/{username}", get(profile))
         .route("/users/{username}/followers", get(followers))
+        .route("/users/{username}/following", get(following))
         .route("/users/{username}/inbox", post(personal_inbox))
         .route("/users/{username}/posts/{id}", get(post_page))
         .layer(DefaultBodyLimit::max(1_048_576))
@@ -103,7 +104,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/setup", get(setup_form).post(create_account))
         .route("/users/{username}", get(profile))
         .route("/users/{username}/followers", get(followers))
-        .route("/users/{username}/following", post(follow_actor))
+        .route(
+            "/users/{username}/following",
+            get(following).post(follow_actor),
+        )
         .route("/users/{username}/posts", post(create_post))
         .route("/users/{username}/posts/{id}", get(post_page))
         .layer(DefaultBodyLimit::max(1_048_576))
@@ -295,7 +299,7 @@ async fn followers(
             Ok(actor) => follower_profile(actor),
             Err(error) => {
                 tracing::warn!(actor_id = %stored.follower, %error, "failed to resolve follower");
-                FollowerProfile {
+                ActorProfile {
                     handle: uri.clone(),
                     name: None,
                     uri,
@@ -308,6 +312,23 @@ async fn followers(
     Ok((
         [(header::VARY, "Accept")],
         Html(layout(&followers_html(&profiles))),
+    )
+        .into_response())
+}
+
+async fn following(
+    State(state): State<AppState>,
+    Path(username): Path<String>,
+) -> Result<Response, StatusCode> {
+    load_account_by_username(&state, &username)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let profiles =
+        load_following(&state, &username).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok((
+        [(header::VARY, "Accept")],
+        Html(layout(&actor_list_html("Following", &profiles))),
     )
         .into_response())
 }
@@ -466,6 +487,11 @@ async fn follow_actor(
             tracing::warn!(%follow_id, remote_actor = %actor.id, %error, "failed to send Follow");
             StatusCode::BAD_GATEWAY
         })?;
+
+    store_following(&state, &account, &actor, &follow_id).map_err(|error| {
+        tracing::error!(%follow_id, remote_actor = %actor.id, %error, "failed to store following relationship");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     tracing::info!(%follow_id, remote_actor = %actor.id, "sent Follow");
     Ok(Redirect::to("/").into_response())
@@ -702,6 +728,87 @@ fn random_activity_token(state: &AppState) -> rusqlite::Result<String> {
     db.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))
 }
 
+fn store_following(
+    state: &AppState,
+    account: &Account,
+    actor: &Actor,
+    follow_id: &Iri,
+) -> rusqlite::Result<()> {
+    let uri = actor.id.to_string();
+    let profile = actor_profile(actor.clone());
+    let inbox = actor.inbox.to_string();
+    let shared_inbox = actor
+        .endpoints
+        .as_ref()
+        .and_then(|endpoints| endpoints.shared_inbox.as_ref())
+        .map(ToString::to_string);
+    let mut db = state.db.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let tx = db.transaction()?;
+    let follower_id: i64 = tx.query_row(
+        r#"
+        SELECT actors.id
+        FROM actors
+        JOIN users ON users.id = actors.user_id
+        WHERE users.username = ?1
+        "#,
+        params![account.username],
+        |row| row.get(0),
+    )?;
+    tx.execute(
+        r#"
+        INSERT INTO actors (uri, handle, name, inbox_url, shared_inbox_url, url)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?1)
+        ON CONFLICT(uri) DO UPDATE SET
+          handle = excluded.handle,
+          name = excluded.name,
+          inbox_url = excluded.inbox_url,
+          shared_inbox_url = excluded.shared_inbox_url,
+          url = excluded.url
+        "#,
+        params![uri, profile.handle, profile.name, inbox, shared_inbox],
+    )?;
+    let following_id: i64 = tx.query_row(
+        "SELECT id FROM actors WHERE uri = ?1",
+        params![uri],
+        |row| row.get(0),
+    )?;
+    tx.execute(
+        r#"
+        INSERT INTO follows (follower_id, following_id, follow_activity_id)
+        VALUES (?1, ?2, ?3)
+        ON CONFLICT(follower_id, following_id) DO UPDATE SET
+          follow_activity_id = excluded.follow_activity_id,
+          created = CURRENT_TIMESTAMP
+        "#,
+        params![follower_id, following_id, follow_id.to_string()],
+    )?;
+    tx.commit()
+}
+
+fn load_following(state: &AppState, username: &str) -> rusqlite::Result<Vec<ActorProfile>> {
+    let db = state.db.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let mut statement = db.prepare(
+        r#"
+        SELECT following.uri, following.name, following.handle
+        FROM follows
+        JOIN actors AS follower ON follower.id = follows.follower_id
+        JOIN actors AS following ON following.id = follows.following_id
+        JOIN users ON users.id = follower.user_id
+        WHERE users.username = ?1
+        ORDER BY follows.created DESC, following.id DESC
+        "#,
+    )?;
+    let profiles = statement.query_map(params![username], |row| {
+        Ok(ActorProfile {
+            uri: row.get(0)?,
+            name: row.get(1)?,
+            handle: row.get(2)?,
+        })
+    })?;
+
+    profiles.collect()
+}
+
 fn post_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PostRecord> {
     Ok(PostRecord {
         uri: row.get(0)?,
@@ -775,7 +882,11 @@ fn public_handle_host() -> anyhow::Result<String> {
         .map_or_else(|| host.to_string(), |port| format!("{host}:{port}")))
 }
 
-fn follower_profile(actor: Actor) -> FollowerProfile {
+fn follower_profile(actor: Actor) -> ActorProfile {
+    actor_profile(actor)
+}
+
+fn actor_profile(actor: Actor) -> ActorProfile {
     let uri = actor.id.to_string();
     let handle = actor
         .preferred_username
@@ -790,7 +901,7 @@ fn follower_profile(actor: Actor) -> FollowerProfile {
             |(username, host)| format!("@{username}@{host}"),
         );
 
-    FollowerProfile {
+    ActorProfile {
         uri,
         name: actor.name.filter(|name| !name.is_empty()),
         handle,
@@ -875,17 +986,21 @@ fn profile_html(name: &str, username: &str, handle: &str, followers: usize) -> S
         escape(name),
         escape(handle),
         escape(username),
-        follower_label
+        follower_label,
     )
 }
 
-fn followers_html(followers: &[FollowerProfile]) -> String {
-    let items = followers
+fn followers_html(followers: &[ActorProfile]) -> String {
+    actor_list_html("Followers", followers)
+}
+
+fn actor_list_html(heading: &str, actors: &[ActorProfile]) -> String {
+    let items = actors
         .iter()
-        .map(|follower| {
-            let href = html_escape::encode_double_quoted_attribute(&follower.uri);
-            let handle = escape(&follower.handle);
-            match follower.name.as_deref() {
+        .map(|actor| {
+            let href = html_escape::encode_double_quoted_attribute(&actor.uri);
+            let handle = escape(&actor.handle);
+            match actor.name.as_deref() {
                 Some(name) => format!(
                     r#"<li><a href="{href}">{}</a> <small>(<a href="{href}" class="secondary">{handle}</a>)</small></li>"#,
                     escape(name)
@@ -897,7 +1012,7 @@ fn followers_html(followers: &[FollowerProfile]) -> String {
         })
         .collect::<String>();
 
-    format!("<h2>Followers</h2><ul>{items}</ul>")
+    format!("<h2>{}</h2><ul>{items}</ul>", escape(heading))
 }
 
 fn post_list_html(posts: &[PostRecord], account: &Account) -> String {

@@ -31,3 +31,11 @@ CREATE TABLE IF NOT EXISTS posts (
   url      TEXT             CHECK (url LIKE 'https://%' OR url LIKE 'http://%'),
   created  TEXT    NOT NULL DEFAULT (CURRENT_TIMESTAMP) CHECK (created <> '')
 );
+
+CREATE TABLE IF NOT EXISTS follows (
+  follower_id       INTEGER NOT NULL REFERENCES actors (id),
+  following_id      INTEGER NOT NULL REFERENCES actors (id),
+  follow_activity_id TEXT   NOT NULL UNIQUE CHECK (follow_activity_id <> ''),
+  created           TEXT    NOT NULL DEFAULT (CURRENT_TIMESTAMP) CHECK (created <> ''),
+  PRIMARY KEY (follower_id, following_id)
+);
