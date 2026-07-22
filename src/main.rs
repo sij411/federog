@@ -257,12 +257,15 @@ async fn profile(
     let follower_count = load_followers(&state, &account)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .len();
+    let following_count = count_following(&state, &account.username)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let posts =
         load_posts(&state, &account.username).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let profile = profile_html(
         &display_name(&account),
         &account.username,
         &format!("@{}@{}", account.username, request_host(&headers)),
+        following_count,
         follower_count,
     );
     let posts = post_list_html(&posts, &account);
@@ -526,10 +529,13 @@ async fn post_page(
     let follower_count = load_followers(&state, &account)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .len();
+    let following_count = count_following(&state, &account.username)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let profile = profile_html(
         &display_name(&account),
         &account.username,
         &format!("@{}@{}", account.username, request_host(&headers)),
+        following_count,
         follower_count,
     );
     let post = post_html(&post, &account);
@@ -809,6 +815,21 @@ fn load_following(state: &AppState, username: &str) -> rusqlite::Result<Vec<Acto
     profiles.collect()
 }
 
+fn count_following(state: &AppState, username: &str) -> rusqlite::Result<i64> {
+    let db = state.db.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
+    db.query_row(
+        r#"
+        SELECT count(*)
+        FROM follows
+        JOIN actors ON actors.id = follows.follower_id
+        JOIN users ON users.id = actors.user_id
+        WHERE users.username = ?1
+        "#,
+        params![username],
+        |row| row.get(0),
+    )
+}
+
 fn post_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PostRecord> {
     Ok(PostRecord {
         uri: row.get(0)?,
@@ -969,7 +990,13 @@ fn home_html(account: &Account) -> String {
     )
 }
 
-fn profile_html(name: &str, username: &str, handle: &str, followers: usize) -> String {
+fn profile_html(
+    name: &str,
+    username: &str,
+    handle: &str,
+    following: i64,
+    followers: usize,
+) -> String {
     let follower_label = if followers == 1 {
         "1 follower".to_string()
     } else {
@@ -979,12 +1006,14 @@ fn profile_html(name: &str, username: &str, handle: &str, followers: usize) -> S
         r#"
         <hgroup>
             <h1><a href="/users/{}">{}</a></h1>
-            <p><span style="user-select: all;">{}</span> &middot; <a href="/users/{}/followers">{}</a></p>
+            <p><span style="user-select: all;">{}</span> &middot; <a href="/users/{}/following">{} following</a> &middot; <a href="/users/{}/followers">{}</a></p>
         </hgroup>
         "#,
         escape(username),
         escape(name),
         escape(handle),
+        escape(username),
+        following,
         escape(username),
         follower_label,
     )
