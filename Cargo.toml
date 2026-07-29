@@ -8,9 +8,9 @@ license = "AGPL-3.0-only"
 ammonia = "4.1.3"
 axum = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-feder-core = { git = "https://github.com/fedify-dev/feder.git", rev = "8843ea622972c5cbbc6f6d2506851a2526db17b7" }
-feder-runtime-server = { git = "https://github.com/fedify-dev/feder.git", rev = "8843ea622972c5cbbc6f6d2506851a2526db17b7" }
-feder-vocab = { git = "https://github.com/fedify-dev/feder.git", rev = "8843ea622972c5cbbc6f6d2506851a2526db17b7" }
+feder-core = { git = "https://github.com/fedify-dev/feder.git", rev = "c7833b3edf2233d98eedf16c72f67940f02a3079" }
+feder-runtime-server = { git = "https://github.com/fedify-dev/feder.git", rev = "c7833b3edf2233d98eedf16c72f67940f02a3079" }
+feder-vocab = { git = "https://github.com/fedify-dev/feder.git", rev = "c7833b3edf2233d98eedf16c72f67940f02a3079" }
 html-escape = "0.2"
 anyhow = "1"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
